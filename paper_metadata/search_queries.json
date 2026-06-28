@@ -1,11 +1,24 @@
 {
-  "1_xai_llm": "(\"explainable AI\" | XAI | explainability | interpretable | interpretability | \"feature attribution\" | \"saliency map\" | \"integrated gradients\" | SHAP | LIME | TCAV | PDP | counterfactuals | \"concept based\") + (LLM | LLMs | \"Large Language Model\" | \"Language Models\" | \"Vision Language Models\" | \"Vision Language Model\" | VLM | VLMs | gpt | llama | claude | gemma | qwen | mistral | mixtral | pythia | bert | roberta | t5 | deepseek | kimi | grok | llava | blip | cohere)",
-
-  "2_mi_llm": "(\"mechanistic interpretability\" | \"mechanistic analysis\" | \"circuit discovery\" | \"circuit analysis\" | \"computational subgraph\" | \"induction head\" | \"reverse engineering\") + (LLM | LLMs | \"Large Language Model\" | \"Language Models\" | \"Vision Language Models\" | \"Vision Language Model\" | VLM | VLMs | gpt | llama | claude | gemma | qwen | mistral | mixtral | pythia | bert | roberta | t5 | deepseek | kimi | grok | llava | blip | cohere)",
-
-  "3_activation_weight_llm": "(\"activation patching\" | \"causal tracing\" | \"causal intervention\" | \"causal mediation\" | \"representation engineering\" | \"steering vector\" | \"activation addition\" | \"weight editing\") + (LLM | LLMs | \"Large Language Model\" | \"Language Models\" | \"Vision Language Models\" | \"Vision Language Model\" | VLM | VLMs | gpt | llama | claude | gemma | qwen | mistral | mixtral | pythia | bert | roberta | t5 | deepseek | kimi | grok | llava | blip | cohere)",
-
-  "4_saes_llm": "(\"probing classifier\" | \"linear probe\" | probing | \"sparse autoencoder\" | \"sparse autoencoders\" | SAEs | \"feature decomposition\") + (LLM | LLMs | \"Large Language Model\" | \"Language Models\" | \"Vision Language Models\" | \"Vision Language Model\" | VLM | VLMs | gpt | llama | claude | gemma | qwen | mistral | mixtral | pythia | bert | roberta | t5 | deepseek | kimi | grok | llava | blip | cohere)",
-
-  "5_logit_attention_llm": "(\"logit lens\" | \"logit analysis\" | \"tuned lens\" | \"vocabulary projection\" | \"attention analysis\" | \"attention pattern\" | \"attention head\" | \"hidden states\" | \"feature visualization\") + (LLM | LLMs | \"Large Language Model\" | \"Language Models\" | \"Vision Language Models\" | \"Vision Language Model\" | VLM | VLMs | gpt | llama | claude | gemma | qwen | mistral | mixtral | pythia | bert | roberta | t5 | deepseek | kimi | grok | llava | blip | cohere)"
+  "defaults": {
+    "date_range": "2020-01-01:",
+    "min_citations": 0,
+    "publication_types": "JournalArticle,Conference,Dataset,Study"
+  },
+  "queries": {
+    "1_xai_llm": {
+      "query": "(\"explainable AI\" | XAI | explainability | interpretable | interpretability | \"feature attribution\" | \"saliency map\" | \"integrated gradients\" | SHAP | LIME | TCAV | PDP | counterfactuals | \"concept based\") + (LLM | LLMs | \"Large Language Model\" | \"Language Models\" | \"Vision Language Models\" | \"Vision Language Model\" | VLM | VLMs | gpt | llama | claude | gemma | qwen | mistral | mixtral | pythia | bert | roberta | t5 | deepseek | kimi | grok | llava | blip | cohere)"
+    },
+    "2_mi_llm": {
+      "query": "(\"mechanistic interpretability\" | \"mechanistic analysis\" | \"circuit discovery\" | \"circuit analysis\" | \"computational subgraph\" | \"induction head\" | \"reverse engineering\") + (LLM | LLMs | \"Large Language Model\" | \"Language Models\" | \"Vision Language Models\" | \"Vision Language Model\" | VLM | VLMs | gpt | llama | claude | gemma | qwen | mistral | mixtral | pythia | bert | roberta | t5 | deepseek | kimi | grok | llava | blip | cohere)"
+    },
+    "3_activation_weight_llm": {
+      "query": "(\"activation patching\" | \"causal tracing\" | \"causal intervention\" | \"causal mediation\" | \"representation engineering\" | \"steering vector\" | \"activation addition\" | \"weight editing\") + (LLM | LLMs | \"Large Language Model\" | \"Language Models\" | \"Vision Language Models\" | \"Vision Language Model\" | VLM | VLMs | gpt | llama | claude | gemma | qwen | mistral | mixtral | pythia | bert | roberta | t5 | deepseek | kimi | grok | llava | blip | cohere)"
+    },
+    "4_saes_llm": {
+      "query": "(\"probing classifier\" | \"linear probe\" | probing | \"sparse autoencoder\" | \"sparse autoencoders\" | SAEs | \"feature decomposition\") + (LLM | LLMs | \"Large Language Model\" | \"Language Models\" | \"Vision Language Models\" | \"Vision Language Model\" | VLM | VLMs | gpt | llama | claude | gemma | qwen | mistral | mixtral | pythia | bert | roberta | t5 | deepseek | kimi | grok | llava | blip | cohere)"
+    },
+    "5_logit_attention_llm": {
+      "query": "(\"logit lens\" | \"logit analysis\" | \"tuned lens\" | \"vocabulary projection\" | \"attention analysis\" | \"attention pattern\" | \"attention head\" | \"hidden states\" | \"feature visualization\") + (LLM | LLMs | \"Large Language Model\" | \"Language Models\" | \"Vision Language Models\" | \"Vision Language Model\" | VLM | VLMs | gpt | llama | claude | gemma | qwen | mistral | mixtral | pythia | bert | roberta | t5 | deepseek | kimi | grok | llava | blip | cohere)"
+    }
+  }
 }

@@ -9,8 +9,8 @@ from pathlib import Path
 
 
 def print_acquisition_report(stats: dict, output_dir: str) -> None:
-    col_w = [28, 8, 8, 8, 12, 12, 14, 12]
-    headers = ["Category", "RawOld", "RawNew", "RawTotal", "IntraDupes", "AfterIntra", "InterRemoved", "FinalUnique"]
+    col_w = [28, 10, 12, 12, 14, 12]
+    headers = ["Category", "Raw", "IntraDupes", "AfterIntra", "InterRemoved", "FinalUnique"]
 
     def row_str(values):
         return "  ".join(str(v).ljust(w) for v, w in zip(values, col_w))
@@ -27,17 +27,16 @@ def print_acquisition_report(stats: dict, output_dir: str) -> None:
     for cat, s in stats.items():
         print(row_str([
             cat,
-            s["raw_old"], s["raw_new"], s["raw"],
-            s["intra_dupes"], s["after_intra"],
+            s["raw"], s["intra_dupes"], s["after_intra"],
             s["inter_removed"], s["final_unique"],
         ]))
-        for k in ("raw_old", "raw_new", "raw", "intra_dupes", "after_intra", "inter_removed", "final_unique"):
+        for k in ("raw", "intra_dupes", "after_intra", "inter_removed", "final_unique"):
             total[k] += s[k]
 
     print(separator)
     print(row_str([
-        "TOTAL", total["raw_old"], total["raw_new"], total["raw"],
-        total["intra_dupes"], total["after_intra"], total["inter_removed"], total["final_unique"],
+        "TOTAL", total["raw"], total["intra_dupes"], total["after_intra"],
+        total["inter_removed"], total["final_unique"],
     ]))
     print("=" * len(separator))
     print(f"\nOutput directory : {os.path.abspath(output_dir)}\n")

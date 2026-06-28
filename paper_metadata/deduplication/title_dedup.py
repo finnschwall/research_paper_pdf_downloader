@@ -32,9 +32,10 @@ def _resolve_pair(existing: dict, challenger: dict) -> tuple[dict, dict]:
 def deduplicate_intra_title(
     papers: list[dict],
     category_name: str,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], dict[str, list[str]]]:
     seen: dict[str, dict] = {}
     duplicate_rows: list[dict] = []
+    merge_map: dict[str, list[str]] = {}
 
     for paper in papers:
         norm = normalize_title(paper.get("title", ""))
@@ -45,28 +46,33 @@ def deduplicate_intra_title(
         else:
             keeper, dropped = _resolve_pair(seen[norm], paper)
             seen[norm] = keeper
+            kept_pid = keeper.get("paperId")
+            dropped_pid = dropped.get("paperId")
+            if kept_pid:
+                merge_map.setdefault(kept_pid, []).append(dropped_pid)
             duplicate_rows.append({
                 "category": category_name,
                 "scope": "intra",
                 "normalized_title": norm,
-                "kept_paperId": keeper.get("paperId", "N/A"),
+                "kept_paperId": kept_pid or "N/A",
                 "kept_citations": keeper.get("citationCount") or 0,
                 "kept_title": keeper.get("title", ""),
-                "dropped_paperId": dropped.get("paperId", "N/A"),
+                "dropped_paperId": dropped_pid or "N/A",
                 "dropped_citations": dropped.get("citationCount") or 0,
                 "dropped_title": dropped.get("title", ""),
             })
 
-    return list(seen.values()), duplicate_rows
+    return list(seen.values()), duplicate_rows, merge_map
 
 
 def deduplicate_inter_title(
     category_data: dict[str, list[dict]],
-) -> tuple[dict[str, list[dict]], list[dict], int]:
+) -> tuple[dict[str, list[dict]], list[dict], int, dict[str, list[str]]]:
     category_order = list(category_data.keys())
     global_seen: dict[str, dict] = {}
     retained_by_cat: dict[str, list[dict]] = {cat: [] for cat in category_order}
     duplicate_rows: list[dict] = []
+    merge_map: dict[str, list[str]] = {}
     inter_dropped_count = 0
 
     for category_name in category_order:
@@ -94,20 +100,25 @@ def deduplicate_inter_title(
                     retained_by_cat[owner_category][entry["idx"]] = keeper
                     entry["paper"] = keeper
 
+                kept_pid = keeper.get("paperId")
+                dropped_pid = dropped.get("paperId")
+                if kept_pid:
+                    merge_map.setdefault(kept_pid, []).append(dropped_pid)
+
                 inter_dropped_count += 1
                 duplicate_rows.append({
                     "owner_category": owner_category,
                     "challenger_category": category_name,
                     "scope": "inter",
                     "normalized_title": norm,
-                    "kept_paperId": keeper.get("paperId", "N/A"),
+                    "kept_paperId": kept_pid or "N/A",
                     "kept_citations": keeper.get("citationCount") or 0,
                     "kept_title": keeper.get("title", ""),
-                    "dropped_paperId": dropped.get("paperId", "N/A"),
+                    "dropped_paperId": dropped_pid or "N/A",
                     "dropped_citations": dropped.get("citationCount") or 0,
                     "dropped_title": dropped.get("title", ""),
                     "citation_swap_performed": keeper is not existing,
                 })
 
     assigned = {cat: retained_by_cat[cat] for cat in category_order}
-    return assigned, duplicate_rows, inter_dropped_count
+    return assigned, duplicate_rows, inter_dropped_count, merge_map

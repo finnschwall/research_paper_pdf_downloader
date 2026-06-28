@@ -21,6 +21,7 @@ from paper_metadata.config.models import (
     MetadataConfig,
     PaperGraphResult,
     RunConfig,
+    RunSummary,
 )
 from paper_metadata.pipeline.orchestrator import MetadataOrchestrator
 from paper_metadata.acquisition.semantic_scholar import fetch_papers_by_ids as _fetch_papers_by_ids
@@ -135,6 +136,7 @@ def fetch_metadata(
     config_path: str | Path | None = None,
     base_dir: str | Path | None = None,
     search_queries_path: str | Path | None = None,
+    label: str | None = None,
     api_recovery: bool = True,
     scrape_recovery: bool = True,
 ) -> None:
@@ -142,8 +144,56 @@ def fetch_metadata(
     run_config = RunConfig(
         run_api_recovery=api_recovery,
         run_scrape_recovery=scrape_recovery,
+        label=label,
     )
     MetadataOrchestrator(resolved_config, run_config).run()
+
+
+def preview_queries(
+    *,
+    config: MetadataConfig | None = None,
+    config_path: str | Path | None = None,
+    search_queries_path: str | Path | None = None,
+) -> dict[str, int]:
+    """
+    Return estimated result counts for each query in search_queries.json without
+    fetching any paper data. One lightweight API request per query.
+
+    Returns {query_id: estimated_count}.
+    """
+    from paper_metadata.acquisition.semantic_scholar import load_search_queries, preview_all_queries
+
+    resolved_config = _resolve_metadata_config(config, config_path, None, search_queries_path)
+    search_queries = load_search_queries(resolved_config.search_queries_path)
+    return preview_all_queries(search_queries, resolved_config)
+
+
+def list_runs(base_dir: str | Path) -> list[RunSummary]:
+    """
+    Scan <base_dir>/runs/ for completed and in-progress runs, returning them
+    sorted newest-first. Each entry is a RunSummary parsed from run.json.
+    """
+    runs_dir = Path(base_dir).resolve() / "runs"
+    if not runs_dir.exists():
+        return []
+
+    summaries: list[RunSummary] = []
+    for run_json_path in sorted(runs_dir.glob("*/run.json"), reverse=True):
+        try:
+            data = json.loads(run_json_path.read_text(encoding="utf-8"))
+            summaries.append(RunSummary(
+                run_id=data["run_id"],
+                label=data.get("label"),
+                started_at=data.get("started_at", ""),
+                completed_at=data.get("completed_at"),
+                status=data.get("status", "unknown"),
+                run_dir=run_json_path.parent,
+                counts=data.get("counts", {}),
+            ))
+        except Exception:
+            pass
+
+    return summaries
 
 
 def recover_abstracts(
@@ -411,6 +461,187 @@ def fetch_citations_and_references(
         reference_options=effective_reference_opts,
         save_dir=resolved_save_dir,
     )
+
+
+# ── SEER ingest bundle exports ────────────────────────────────────────────────
+
+def export_keyword_bundle(
+    *,
+    bundle_dir: str | Path | None = None,
+    source_label: str | None = None,
+    label: str | None = None,
+    config: MetadataConfig | None = None,
+    config_path: str | Path | None = None,
+    base_dir: str | Path | None = None,
+    search_queries_path: str | Path | None = None,
+    api_recovery: bool = True,
+    scrape_recovery: bool = True,
+) -> Path:
+    """
+    Run the full keyword-search pipeline and write a SEER ingest bundle.
+
+    The bundle is written to bundle_dir (default:
+    <base_dir>/search_results/seer_ingest/).  All pipeline outputs are also
+    written to the usual search_results/ subdirectories.
+
+    Returns the Path of the written bundle directory.
+    """
+    from paper_metadata.export.seer_bundle import get_library_version
+    resolved_config = _resolve_metadata_config(config, config_path, base_dir, search_queries_path)
+
+    if bundle_dir is not None:
+        resolved_config.output.base_dir = str(
+            Path(resolved_config.output.base_dir).resolve()
+        )
+
+    run_config = RunConfig(
+        run_api_recovery=api_recovery,
+        run_scrape_recovery=scrape_recovery,
+        source_label=source_label,
+        label=label,
+    )
+    result_path = MetadataOrchestrator(resolved_config, run_config).run()
+
+    if bundle_dir is not None:
+        import shutil
+        default_bundle = result_path
+        target = Path(bundle_dir).resolve()
+        if default_bundle and default_bundle != target:
+            target.mkdir(parents=True, exist_ok=True)
+            for fname in ("manifest.json", "papers.json"):
+                src = default_bundle / fname
+                if src.exists():
+                    shutil.copy2(src, target / fname)
+        return target
+
+    return result_path
+
+
+def export_by_id_bundle(
+    ids: str | list[str],
+    *,
+    bundle_dir: str | Path,
+    source_label: str | None = None,
+    config: MetadataConfig | None = None,
+    config_path: str | Path | None = None,
+    api_recovery: bool = False,
+    scrape_recovery: bool = False,
+) -> Path:
+    """
+    Fetch metadata for explicit paper IDs and write a SEER ingest bundle.
+
+    Returns the Path of the written bundle directory.
+    """
+    from paper_metadata.export.seer_bundle import get_library_version, write_bundle
+
+    papers = fetch_papers_by_id(
+        ids,
+        config=config,
+        config_path=config_path,
+        api_recovery=api_recovery,
+        scrape_recovery=scrape_recovery,
+    )
+
+    for p in papers:
+        p["_provenance"] = {
+            "matched_queries": [],
+            "seed_paper_id": None,
+            "edge_type": None,
+            "is_influential": None,
+            "input_id": p.pop("_input_id", None),
+            "fetch_status": p.pop("_fetch_status", None),
+        }
+
+    bundle_path = Path(bundle_dir).resolve()
+    write_bundle(
+        bundle_path,
+        run_type="by_id",
+        papers=papers,
+        manifest_extra={
+            "queries": {},
+            "seeds": [],
+            "fetch_params": {},
+            "source_label": source_label,
+        },
+        library_version=get_library_version(),
+    )
+    return bundle_path
+
+
+def export_citation_bundle(
+    ids: str | list[str],
+    *,
+    bundle_dir: str | Path,
+    source_label: str | None = None,
+    citations: bool = True,
+    references: bool = True,
+    config: MetadataConfig | None = None,
+    config_path: str | Path | None = None,
+    **kwargs,
+) -> Path:
+    """
+    Fetch citation/reference graph for seed papers and write a SEER ingest bundle.
+
+    Returns the Path of the written bundle directory.
+    """
+    from paper_metadata.export.seer_bundle import get_library_version, write_bundle
+
+    graph_results = fetch_citations_and_references(
+        ids,
+        citations=citations,
+        references=references,
+        config=config,
+        config_path=config_path,
+        **kwargs,
+    )
+
+    flat_papers: list[dict] = []
+    seeds: list[dict] = []
+
+    for result in graph_results:
+        edges_fetched = []
+        if citations and result.citations:
+            edges_fetched.append("citations")
+        if references and result.references:
+            edges_fetched.append("references")
+        seeds.append({"seed_paper_id": result.paper_id, "edges": edges_fetched})
+
+        for p in result.citations:
+            p["_provenance"] = {
+                "matched_queries": [],
+                "seed_paper_id": result.paper_id,
+                "edge_type": "citation",
+                "is_influential": p.pop("_is_influential", False),
+                "input_id": None,
+                "fetch_status": None,
+            }
+            flat_papers.append(p)
+
+        for p in result.references:
+            p["_provenance"] = {
+                "matched_queries": [],
+                "seed_paper_id": result.paper_id,
+                "edge_type": "reference",
+                "is_influential": p.pop("_is_influential", False),
+                "input_id": None,
+                "fetch_status": None,
+            }
+            flat_papers.append(p)
+
+    bundle_path = Path(bundle_dir).resolve()
+    write_bundle(
+        bundle_path,
+        run_type="citation_graph",
+        papers=flat_papers,
+        manifest_extra={
+            "queries": {},
+            "seeds": seeds,
+            "fetch_params": {},
+            "source_label": source_label,
+        },
+        library_version=get_library_version(),
+    )
+    return bundle_path
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

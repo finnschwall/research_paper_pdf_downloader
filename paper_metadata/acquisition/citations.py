@@ -388,11 +388,21 @@ def fetch_paper_graph(
         # not the SS SHA unless the caller supplied a SHA; for other formats
         # (DOI:..., ARXIV:...) it retains the prefix.  The field documents
         # the exact identifier that was sent to the API.
+        def _extract_citation(e: dict) -> dict:
+            p = dict(e.get("citingPaper") or e)
+            p["_is_influential"] = bool(e.get("isInfluential"))
+            return p
+
+        def _extract_reference(e: dict) -> dict:
+            p = dict(e.get("citedPaper") or e)
+            p["_is_influential"] = bool(e.get("isInfluential"))
+            return p
+
         results.append(PaperGraphResult(
             input_id=raw_id,
             paper_id=paper_id_param,
-            citations=[e.get("citingPaper", e) for e in citations_data.edges],
-            references=[e.get("citedPaper", e) for e in references_data.edges],
+            citations=[_extract_citation(e) for e in citations_data.edges],
+            references=[_extract_reference(e) for e in references_data.edges],
             citations_fetched=citations_data.raw_count,
             references_fetched=references_data.raw_count,
             citations_truncated=citations_data.truncated,

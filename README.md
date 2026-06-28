@@ -15,11 +15,19 @@ This is an automated paper data retriever system which has is divided into two p
 - [Paper Metadata Pipeline](#paper-metadata-pipeline)
   - [How It Works](#how-it-works)
   - [search_queries.json](#search_queriesjson)
+  - [Workflow: preview → run → audit](#workflow-preview--run--audit)
   - [Running from the CLI](#running-from-the-cli)
   - [Programmatic Usage (paper_metadata)](#programmatic-usage-paper_metadata)
   - [Fetching Metadata by ID](#fetching-metadata-by-id)
   - [Citation and Reference Graph Retrieval](#citation-and-reference-graph-retrieval)
   - [Output Structure (paper_metadata)](#output-structure-paper_metadata)
+- [SEER Ingest Bundle](#seer-ingest-bundle)
+  - [Bundle Layout](#bundle-layout)
+  - [manifest.json Fields](#manifestjson-fields)
+  - [papers.json Record Shape](#papersjson-record-shape)
+  - [_provenance Rules](#_provenance-rules)
+  - [Producing a Bundle (CLI)](#producing-a-bundle-cli)
+  - [Producing a Bundle (Python)](#producing-a-bundle-python)
 - [Input Formats (paper_downloader)](#input-formats-paper_downloader)
 - [Running the Download Pipeline](#running-the-download-pipeline)
 - [Output Structure (paper_downloader)](#output-structure-paper_downloader)
@@ -97,16 +105,17 @@ The `config.json` file controls all pipeline behaviour.
 
 ### paper_metadata config.json
 
-Located at `paper_metadata/config.json`. Controls all metadata fetch, deduplication, and abstract recovery behaviour. Do changes accordingly, by default pipeline will run fine.
+Located at `paper_metadata/config.json`. Controls metadata fetch, deduplication, and abstract recovery behaviour.
 
 **Important fields:**
 
 | Field | What it controls |
 |---|---|
-| `output.base_dir` | Root directory where all `search_results/` subdirectories are created. **Set this to your project folder** |
+| `output.base_dir` | Root directory where all `runs/` subdirectories are created. **Set this to your project folder** |
 | `search_queries_path` | Absolute path to `search_queries.json`. **Set this to your queries file location** |
+| `semantic_scholar.fields` | Comma-separated list of SS metadata fields returned per paper (returned columns, not search filters — stays in config) |
 
-To add new keyword categories or change existing search terms, edit `search_queries.json` directly, no code changes needed.
+To add new keyword queries or change search terms, edit `search_queries.json` directly; no code changes needed.
 
 ---
 
@@ -116,21 +125,126 @@ To add new keyword categories or change existing search terms, edit `search_quer
 
 The pipeline runs five stages in sequence:
 
-**Stage 1 — Semantic Scholar bulk fetch.** For each category defined in `search_queries.json`, the pipeline runs two paginated bulk queries against the Semantic Scholar API. Each query fetches up to 1000 papers per request and follows pagination tokens until all results are retrieved. Results are saved as raw JSON slices in `search_results/raw_old/` and `search_results/raw_new/`.
+**Stage 1 — Semantic Scholar bulk fetch.** For each query defined in `search_queries.json`, the pipeline runs a paginated bulk query against the Semantic Scholar API. Each query fetches up to 1000 papers per request and follows pagination tokens until all results are retrieved. Results are saved to `runs/<run_id>/raw/`.
 
-**Stage 2 — ID-based deduplication.** Within each category, papers sharing the same Semantic Scholar `paperId` are collapsed (intra-category dedup). Then, across all categories in priority order, any paper that already appeared in a higher-priority category is removed from lower-priority categories (inter-category dedup). This ensures each paper appears in exactly one category. Results are saved to `search_results/final/`.
+**Stage 2 — ID-based deduplication.** Within each query, papers sharing the same Semantic Scholar `paperId` are collapsed (intra-category dedup). Then, across all queries in priority order, any paper that already appeared in a higher-priority query is removed from lower-priority ones (inter-category dedup). Each paper ends up in exactly one query bucket. Results are saved to `runs/<run_id>/final/`.
 
-**Stage 3 — Title-based deduplication.** The same paper can exist under two different `paperId` values if it appears in SS as both a preprint and a published version. Title-based dedup catches these cases: titles are normalised (lowercased, punctuation stripped, version suffixes removed) and compared. When duplicates are found the version with the higher citation count is kept. Intra and inter-category passes are both run. Duplicate reports are saved as CSV files in `search_results/reports/`. Results are saved to `search_results/final_title_deduped/`.
+**Stage 3 — Title-based deduplication.** The same paper can exist under two different `paperId` values (preprint + published version). Title-based dedup catches these: titles are normalised (lowercased, punctuation stripped, version suffixes removed) and compared. The version with the higher citation count is kept. Duplicate reports are saved as CSV files in `runs/<run_id>/reports/`. Results are saved to `runs/<run_id>/final_title_deduped/`.
 
-**Stage 4 — API-based abstract recovery.** For papers with missing abstracts, the pipeline tries a chain of API sources in order. The chain differs based on whether an ArXiv ID is present. Sources tried include ArXiv (by ID and title), OpenAlex (by DOI and title), PubMed, ACL Anthology, EuropePMC (by DOI, PMID, and title), Crossref, CORE, and Semantic Scholar as the final fallback. Each source applies title similarity verification when searching by title to avoid returning abstracts for the wrong paper. Results are saved to `search_results/final_recovered_abstract/`.
+**Stage 4 — API-based abstract recovery.** For papers with missing abstracts, the pipeline tries a chain of API sources: ArXiv (by ID and title), OpenAlex (by DOI and title), PubMed, ACL Anthology, EuropePMC (by DOI, PMID, and title), Crossref, CORE, and Semantic Scholar. Each source applies title similarity verification. Results are saved to `runs/<run_id>/final_recovered_abstract/`.
 
-**Stage 5 — Scrape-based abstract recovery.** For papers that still lack an abstract after Stage 4, the pipeline attempts to scrape the publisher webpage via the paper's DOI. Publisher-specific HTML parsers handle Springer, Nature, IEEE, Elsevier, Wiley, Taylor & Francis, Oxford UP, Cambridge UP, Frontiers, MDPI, ACM, PLOS, AAAI, and IJCAI. A generic JSON-LD and meta-tag fallback handles any unrecognised publisher. Results are saved to `search_results/publisher_scraped/`.
+**Stage 5 — Scrape-based abstract recovery.** For papers still missing an abstract, the pipeline scrapes the publisher webpage via the paper's DOI. Publisher-specific parsers cover Springer, Nature, IEEE, Elsevier, Wiley, Taylor & Francis, Oxford UP, Cambridge UP, Frontiers, MDPI, ACM, PLOS, AAAI, and IJCAI, with a generic JSON-LD fallback. Results are saved to `runs/<run_id>/publisher_scraped/`.
 
 ---
 
 ### search_queries.json
 
-This file defines the keyword categories used to fetch papers from Semantic Scholar. It is a JSON object where each key is a category name and each value is a Semantic Scholar bulk search query string. Category names become the filenames for all output JSON files throughout the pipeline. The order of categories matters for inter-category deduplication: papers that match multiple categories are assigned to the first matching category. To add a new research topic, add a new key-value pair. To change the scope of an existing search, edit the query string. The Semantic Scholar bulk search supports Boolean operators `|` (OR), `+` (AND), and quoted phrases.
+This file defines the keyword queries used to fetch papers from Semantic Scholar. It has two top-level keys:
+
+- **`defaults`** — search parameters applied to every query unless overridden.
+- **`queries`** — a map of query IDs to query entries. Each entry must have a `"query"` string and can override any default.
+
+Query IDs become the filenames for all output JSON files throughout the pipeline. The order of IDs determines inter-query deduplication priority: papers matching multiple queries are assigned to the first matching one.
+
+The Semantic Scholar bulk search supports Boolean operators `|` (OR), `+` (AND), and quoted phrases.
+
+**Supported parameter keys** (in `defaults` or per-query):
+
+| Key | SS API param | Example |
+|---|---|---|
+| `date_range` | `publicationDateOrYear` | `"2020-01-01:"` |
+| `min_citations` | `minCitationCount` | `5` |
+| `publication_types` | `publicationTypes` | `"JournalArticle,Conference"` |
+| `venue` | `venue` | `"NeurIPS,ICML"` |
+| `fields_of_study` | `fieldsOfStudy` | `"Computer Science"` |
+| `open_access_pdf` | `openAccessPdf` | `true` |
+| `year` | `year` | `"2022-2024"` |
+
+**Example:**
+
+```json
+{
+  "defaults": {
+    "date_range": "2020-01-01:",
+    "min_citations": 0,
+    "publication_types": "JournalArticle,Conference,Dataset,Study"
+  },
+  "queries": {
+    "1_xai_llm": {
+      "query": "(\"explainable AI\" | XAI) + (LLM | \"large language model\")"
+    },
+    "2_saes_llm": {
+      "query": "(\"sparse autoencoder\" | SAE) + (LLM | transformer)",
+      "min_citations": 5
+    }
+  }
+}
+```
+
+Each query is an atomic, self-contained search. If you need the same topic with different date ranges or citation thresholds, write two query entries — one for each set of parameters.
+
+---
+
+### Workflow: preview → run → audit
+
+The recommended workflow for systematic reviews follows three steps:
+
+**1. Preview** — check how many results each query will surface before committing to a full fetch:
+
+```bash
+python -m paper_metadata.export preview \
+  --search-queries-path paper_metadata/search_queries.json
+```
+
+Or in Python:
+```python
+counts = preview_queries(search_queries_path="paper_metadata/search_queries.json")
+# {'1_xai_llm': 4821, '2_saes_llm': 312, ...}
+```
+
+Preview makes one lightweight API request per query (no paper data is fetched). Use it to tune queries before running the full pipeline.
+
+**2. Run** — execute the full pipeline:
+
+```bash
+python -m paper_metadata.export keyword \
+  --base-dir /data/myproject \
+  --label "xai-sweep-june" \
+  --no-recovery
+```
+
+Each run creates a timestamped directory under `<base_dir>/runs/`:
+
+```
+runs/
+  20260628-142300_xai-sweep-june/
+    run.json                  ← written at start; updated on completion
+    search_queries.json       ← exact snapshot of queries used
+    raw/
+    final/
+    final_title_deduped/
+    final_recovered_abstract/
+    publisher_scraped/
+    reports/
+    seer_ingest/
+```
+
+`run.json` records the run ID, label, start/end times, status, and per-query paper counts.
+
+**3. Audit** — inspect past runs at any time:
+
+```bash
+python -m paper_metadata.export list-runs --base-dir /data/myproject
+```
+
+Or in Python:
+```python
+runs = list_runs("/data/myproject")
+for r in runs:
+    print(r.run_id, r.status, r.counts)
+```
+
+Each run directory is fully self-contained: the `search_queries.json` snapshot inside it records exactly what was searched, and `run.json` records the parameters and counts. This satisfies PRISMA documentation requirements for systematic reviews.
 
 ---
 
@@ -138,12 +252,34 @@ This file defines the keyword categories used to fetch papers from Semantic Scho
 
 All commands are run from the **parent directory** of `paper_metadata/` using Python's `-m` flag.
 
-**Full pipeline with explicit output location and queries file (overrides config.json):**
+**Preview query result counts (no data fetched):**
 
 ```bash
-python -m paper_metadata.main \
+python -m paper_metadata.export preview \
+  --search-queries-path paper_metadata/search_queries.json
+```
+
+**Full pipeline:**
+
+```bash
+python -m paper_metadata.export keyword \
+  --base-dir /path/to/project \
+  --label "my-run-label"
+```
+
+**Full pipeline with explicit queries file:**
+
+```bash
+python -m paper_metadata.export keyword \
   --base-dir /path \
-  --search-queries-path /path
+  --search-queries-path /path/to/search_queries.json \
+  --label "sweep-v2"
+```
+
+**List past runs:**
+
+```bash
+python -m paper_metadata.export list-runs --base-dir /path/to/project
 ```
 
 ---
@@ -151,40 +287,46 @@ python -m paper_metadata.main \
 ### Programmatic Usage (paper_metadata)
 
 ```python
-from paper_data import fetch_metadata, recover_abstracts
+from paper_data import fetch_metadata, preview_queries, list_runs, recover_abstracts
+
+# Preview result counts before fetching
+counts = preview_queries(search_queries_path="/path/to/search_queries.json")
+# {'1_xai_llm': 4821, '2_saes_llm': 312, ...}
+
+# Full pipeline — creates runs/<timestamp>/ under base_dir
+fetch_metadata(
+    base_dir="/path",
+    search_queries_path="/path/to/search_queries.json",
+    label="xai-sweep-june",            # optional, appended to run directory name
+)
 
 # Full pipeline with default config
 fetch_metadata()
 
-# Full pipeline, custom output location, both recoveries
-fetch_metadata(
-    base_dir="/path",                  # your local project directory path
-    search_queries_path="/path",
-)
-
-# Full pipeline, custom config file, skip scrape recovery
-fetch_metadata(
-    config_path="/path/to/your/config.json",
-    scrape_recovery=False,
-)
-
 # Fetch and dedup only, no recovery
 fetch_metadata(api_recovery=False, scrape_recovery=False)
 
-# Run both recoveries on already-fetched data
+# List all past runs sorted newest-first
+runs = list_runs("/path")
+for r in runs:
+    print(r.run_id, r.status, r.label)
+    print(r.counts)           # {query_id: {"raw": ..., "final": ...}}
+    print(r.run_dir)          # Path to the run directory
+
+# Run recovery stages on already-fetched data in a prior run's directory
 recover_abstracts(
-    "/path/to/search_results/final_title_deduped"
+    "/path/runs/20260628-142300_xai-sweep-june/final_title_deduped"
 )
 
-# Run API recovery only on existing files
+# API recovery only
 recover_abstracts(
-    "/path/to/search_results/final_title_deduped",
+    "/path/runs/.../final_title_deduped",
     scrape_recovery=False,
 )
 
-# Run scrape recovery only on files that already went through API recovery
+# Scrape recovery only on files that already went through API recovery
 recover_abstracts(
-    "/path/to/search_results/final_recovered_abstract",
+    "/path/runs/.../final_recovered_abstract",
     api_recovery=False,
 )
 ```
@@ -316,37 +458,236 @@ The API silently truncates at ~9,999 edges per endpoint; `citations_truncated` /
 
 ### Output Structure (paper_metadata)
 
-All output is created under `base_dir/search_results/`:
+Each pipeline run creates a timestamped directory under `<base_dir>/runs/`:
 
 ```
-search_results/
-  raw_old/
-    1_xai_llm.json          # Raw SS fetch, old date range
-    2_mi_llm.json
-    ...
-  raw_new/
-    1_xai_llm.json          # Raw SS fetch, recent date range
-    ...
-  final/
-    1_xai_llm.json          # After ID-based deduplication
-    ...
-  final_title_deduped/
-    1_xai_llm.json          # After title-based deduplication
-    ...
-  final_recovered_abstract/
-    1_xai_llm.json          # After API-based abstract recovery
-    ...
-  publisher_scraped/
-    1_xai_llm.json          # After scrape-based abstract recovery
-    ...
-  reports/
-    acquisition_stats.json
-    title_dedup_stats.json
-    intra_title_duplicates.csv
-    inter_title_duplicates.csv
+<base_dir>/
+  runs/
+    20260628-142300_xai-sweep-june/
+      run.json                      # run metadata: status, timestamps, per-query counts
+      search_queries.json           # snapshot of the queries used for this run
+      raw/
+        1_xai_llm.json              # raw SS fetch
+        2_mi_llm.json
+        ...
+      final/
+        1_xai_llm.json              # after ID-based deduplication
+        ...
+      final_title_deduped/
+        1_xai_llm.json              # after title-based deduplication
+        ...
+      final_recovered_abstract/
+        1_xai_llm.json              # after API-based abstract recovery
+        ...
+      publisher_scraped/
+        1_xai_llm.json              # after scrape-based abstract recovery
+        ...
+      reports/
+        acquisition_stats.json
+        title_dedup_stats.json
+        intra_title_duplicates.csv
+        inter_title_duplicates.csv
+      seer_ingest/
+        manifest.json
+        papers.json
+    20260615-093000/                # earlier run, unaffected
+      ...
 ```
 
-Each stage reads from the previous stage's directory and writes to its own. Earlier stage outputs are preserved so you can re-run any stage independently using `--input-dir`.
+Each stage reads from the previous stage's directory and writes to its own. The `run.json` file is written at the start of each run (status: `running`) and updated on completion (status: `complete`).
+
+**`run.json` schema:**
+
+```json
+{
+  "run_id": "20260628-142300_xai-sweep-june",
+  "label": "xai-sweep-june",
+  "started_at": "2026-06-28T14:23:00",
+  "completed_at": "2026-06-28T15:47:00",
+  "status": "complete",
+  "search_queries_file": "/original/path/search_queries.json",
+  "stages": { "api_recovery": true, "scrape_recovery": false },
+  "counts": {
+    "1_xai_llm": { "raw": 4821, "final": 2103 },
+    "2_mi_llm":  { "raw": 1240, "final": 891 }
+  }
+}
+```
+
+---
+
+## SEER Ingest Bundle
+
+Every pipeline run automatically produces a **SEER ingest bundle** — a self-describing,
+schema-versioned directory that the SEER Django application can import directly.  The
+bundle is the single coupling point between this library (the producer) and SEER (the
+consumer); neither side reaches into the other's internal data structures.
+
+The frozen interface specification lives in `00_CONTRACT.md` in this repository.
+
+### Bundle Layout
+
+```
+<bundle_dir>/
+    manifest.json      # run-level metadata (the "run snapshot")
+    papers.json        # flat JSON array of paper records
+```
+
+The default location for a keyword-search run is:
+
+```
+<base_dir>/runs/<run_id>/seer_ingest/
+```
+
+### manifest.json Fields
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `schema_version` | string | always | `"1.0"` — SEER rejects mismatches |
+| `pipeline` | string | always | constant `"paper_metadata"` |
+| `library_version` | string | always | git SHA or package version |
+| `generated_at` | string | always | ISO-8601 UTC timestamp |
+| `run_type` | string | always | `keyword_search` \| `by_id` \| `citation_graph` |
+| `source_label` | string\|null | optional | human label passed via `--label` |
+| `fetch_params` | object | always | date filters + citation thresholds |
+| `queries` | object | `keyword_search` | category key → SS query string |
+| `seeds` | array | `citation_graph` | list of `{seed_paper_id, edges}` |
+| `counts` | object | always | `total_unique_papers`, `per_query`, `identity_dropped` |
+| `papers_file` | string | always | `"papers.json"` |
+
+`fetch_params` shape for `keyword_search`: per-query SS API params keyed by query ID:
+
+```json
+{
+  "1_xai_llm": { "publicationDateOrYear": "2020-01-01:", "publicationTypes": "JournalArticle,Conference" },
+  "2_saes_llm": { "publicationDateOrYear": "2020-01-01:", "minCitationCount": 5 }
+}
+```
+
+### papers.json Record Shape
+
+Each element is a standard Semantic Scholar metadata record plus a `_provenance` object:
+
+```jsonc
+{
+  "paperId": "649def34f8be52c8b66281af98ae884c09aef38b",
+  "externalIds": { "DOI": "10.1016/...", "ArXiv": "2410.20513" },
+  "title": "…",
+  "abstract": "…",
+  "authors": [{ "authorId": "…", "name": "…" }],
+  "year": 2023,
+  "publicationDate": "2023-05-04",
+  "venue": "…",
+  "citationCount": 42,
+  "isOpenAccess": true,
+  "openAccessPdf": { "url": "https://…pdf" },
+
+  "_provenance": {
+    "matched_queries": ["1_xai_llm", "3_activation_weight_llm"],
+    "seed_paper_id": null,
+    "edge_type": null,
+    "is_influential": null,
+    "input_id": null,
+    "fetch_status": null
+  }
+}
+```
+
+`_provenance` per run type:
+
+| Field | `keyword_search` | `by_id` | `citation_graph` |
+|---|---|---|---|
+| `matched_queries` | non-empty list of query keys | `[]` | `[]` |
+| `seed_paper_id` | null | null | SS paper ID of the seed |
+| `edge_type` | null | null | `"citation"` or `"reference"` |
+| `is_influential` | null | null | bool |
+| `input_id` | null | original caller string | null |
+| `fetch_status` | null | `"found"` \| `"not_found"` \| `"invalid_id"` | null |
+
+### _provenance Rules
+
+1. **Always present.** Every record has `_provenance` with all six keys (unused ones are `null` / `[]`).
+2. **`keyword_search`**: `matched_queries` is non-empty. Every key is present in `manifest.queries`. It includes the category that owns the paper *and* every other query whose result set contained the same paper before deduplication — intra-run multi-query membership is fully captured here.
+3. **`citation_graph`**: `seed_paper_id` non-null, `edge_type` ∈ `{"citation","reference"}`, `is_influential` is a bool. A paper appearing under multiple seeds yields multiple records; SEER deduplicates and keeps both edges.
+4. **`by_id`**: `input_id` non-null, `fetch_status` ∈ `{"found","not_found","invalid_id"}`. Records with `fetch_status != "found"` are included so SEER can log them.
+5. **Identity guarantee.** Every `found` record has at least one of `paperId`, `externalIds.DOI`, or `externalIds.ArXiv`. Records that fail this check are dropped and counted in `manifest.counts.identity_dropped`.
+
+**Division of labour:** the producer (this library) guarantees intra-run multi-query
+membership in `matched_queries`.  Cross-run accumulation (the same paper re-found by a
+later run) and `was_new_at_ingest` tracking are SEER's responsibility.
+
+### Producing a Bundle (CLI)
+
+```bash
+# Preview result counts — one lightweight request per query, no data fetched
+python -m paper_metadata.export preview \
+  --search-queries-path paper_metadata/search_queries.json
+
+# Keyword sweep — bundle lands in <base_dir>/runs/<run_id>/seer_ingest/
+python -m paper_metadata.export keyword \
+  --base-dir /data/myproject \
+  --label "xai-sweep-2026-07"
+
+# Skip abstract recovery for a faster test run
+python -m paper_metadata.export keyword \
+  --base-dir /data/myproject \
+  --no-recovery
+
+# List past runs
+python -m paper_metadata.export list-runs --base-dir /data/myproject
+
+# Explicit paper ID list
+python -m paper_metadata.export by-id \
+  --ids paper_ids.json \
+  --bundle-dir /data/bundles/manual-batch-1 \
+  --label "manual seed set"
+
+# Snowball from seed papers (fetch both citations and references)
+python -m paper_metadata.export citation \
+  --ids seeds.json \
+  --bundle-dir /data/bundles/snowball-r1 \
+  --citations --references \
+  --label "snowball round 1"
+```
+
+`--ids` accepts either a JSON file containing a list of ID strings, or a
+comma-separated list of IDs directly on the command line.
+
+When neither `--citations` nor `--references` is specified for the `citation`
+subcommand, both are fetched by default.
+
+### Producing a Bundle (Python)
+
+```python
+from paper_data import export_keyword_bundle, export_by_id_bundle, export_citation_bundle
+
+# Keyword sweep — run lands in <base_dir>/runs/<run_id>/seer_ingest/
+bundle_dir = export_keyword_bundle(
+    base_dir="/data/myproject",
+    source_label="XAI/LLM sweep 2026-07",
+    label="xai-sweep-2026-07",         # appended to run directory name
+)
+
+# Explicit IDs
+bundle_dir = export_by_id_bundle(
+    ["2106.15928", "DOI:10.18653/v1/N18-3011"],
+    bundle_dir="/data/bundles/manual-1",
+    source_label="manual seed set",
+)
+
+# Citation graph
+bundle_dir = export_citation_bundle(
+    ["649def34f8be52c8b66281af98ae884c09aef38b"],
+    bundle_dir="/data/bundles/snowball-r1",
+    citations=True,
+    references=True,
+    source_label="snowball round 1",
+)
+```
+
+All three functions re-run the relevant fetch (they do not read from existing output
+files). If you have already run `fetch_metadata()`, the keyword bundle will have been
+written automatically to `<base_dir>/runs/<run_id>/seer_ingest/`.
 
 ---
 

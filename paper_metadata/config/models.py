@@ -6,13 +6,17 @@ from pathlib import Path
 
 @dataclass
 class SemanticScholarConfig:
-    date_filter_old: str
-    date_filter_new: str
-    min_citation_old: int
-    min_citation_new: int
-    publication_types: str
     fields: str
     bulk_search_url: str = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
+
+
+@dataclass
+class SearchQuery:
+    """One atomic Semantic Scholar bulk-search request, ready to execute."""
+    id: str
+    query: str
+    # SS API param names (e.g. "publicationDateOrYear") → values, already translated.
+    ss_params: dict
 
 
 @dataclass
@@ -95,3 +99,17 @@ class RunConfig:
     run_api_recovery: bool = False
     run_scrape_recovery: bool = False
     input_dir: Path | None = None
+    source_label: str | None = None
+    label: str | None = None
+
+
+@dataclass
+class RunSummary:
+    """Parsed view of a run.json manifest, returned by list_runs()."""
+    run_id: str
+    label: str | None
+    started_at: str
+    completed_at: str | None
+    status: str
+    run_dir: Path
+    counts: dict

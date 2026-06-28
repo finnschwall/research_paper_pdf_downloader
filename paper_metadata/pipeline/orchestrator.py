@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
 from ..acquisition.semantic_scholar import fetch_all_categories, load_search_queries
-from ..config.models import MetadataConfig, RunConfig
+from ..config.models import MetadataConfig, RunConfig, SearchQuery
 from ..deduplication.id_dedup import deduplicate_inter as id_dedup_inter
 from ..deduplication.title_dedup import deduplicate_inter_title, deduplicate_intra_title
 from ..recovery.api_recovery import ApiRecoveryProvider
@@ -62,21 +63,46 @@ class MetadataOrchestrator:
         self._run_config = run_config or RunConfig()
         base = Path(config.output.base_dir).resolve()
 
+        rc = self._run_config
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        label_suffix = f"_{rc.label}" if rc.label else ""
+        self._run_id = f"{ts}{label_suffix}"
+        self._run_root = base / "runs" / self._run_id
+
         self._dirs = {
-            "raw_old":                  base / "search_results" / "raw_old",
-            "raw_new":                  base / "search_results" / "raw_new",
-            "final":                    base / "search_results" / "final",
-            "final_title_deduped":      base / "search_results" / "final_title_deduped",
-            "final_recovered_abstract": base / "search_results" / "final_recovered_abstract",
-            "publisher_scraped":        base / "search_results" / "publisher_scraped",
-            "reports":                  base / "search_results" / "reports",
+            "raw":                      self._run_root / "raw",
+            "final":                    self._run_root / "final",
+            "final_title_deduped":      self._run_root / "final_title_deduped",
+            "final_recovered_abstract": self._run_root / "final_recovered_abstract",
+            "publisher_scraped":        self._run_root / "publisher_scraped",
+            "reports":                  self._run_root / "reports",
+            "seer_ingest":              self._run_root / "seer_ingest",
         }
 
-    def run(self) -> None:
+    def run(self) -> Path | None:
         self._create_dirs()
         rc = self._run_config
 
-        
+        started_at = datetime.now().isoformat()
+        run_manifest: dict = {
+            "run_id": self._run_id,
+            "label": rc.label,
+            "started_at": started_at,
+            "completed_at": None,
+            "status": "running",
+            "search_queries_file": str(self._config.search_queries_path),
+            "stages": {
+                "api_recovery": rc.run_api_recovery,
+                "scrape_recovery": rc.run_scrape_recovery,
+            },
+            "counts": {},
+        }
+        _save_json(run_manifest, self._run_root / "run.json")
+
+        sq_src = Path(self._config.search_queries_path)
+        if sq_src.exists():
+            shutil.copy2(sq_src, self._run_root / "search_queries.json")
+
         if rc.input_dir is not None:
             input_dir = Path(rc.input_dir).resolve()
             if not input_dir.exists():
@@ -107,62 +133,67 @@ class MetadataOrchestrator:
                     "--input-dir given but no recovery stage requested. "
                     "Use --api-recovery and/or --scrape-recovery."
                 )
-            return
+            run_manifest["completed_at"] = datetime.now().isoformat()
+            run_manifest["status"] = "complete"
+            _save_json(run_manifest, self._run_root / "run.json")
+            return None
 
         # Full pipeline mode
-        queries = load_search_queries(self._config.search_queries_path)
-        if not queries:
+        search_queries = load_search_queries(self._config.search_queries_path)
+        if not search_queries:
             raise ValueError(
-                f"search_queries.json is empty. Add at least one category. "
+                f"search_queries.json has no queries. Add at least one entry under 'queries'. "
                 f"(path: {self._config.search_queries_path})"
             )
 
-        category_order = list(queries.keys())
-        logger.info("Full pipeline: %d categories", len(category_order))
+        category_order = [sq.id for sq in search_queries]
+        logger.info("Full pipeline: %d queries", len(category_order))
 
         # Stage 1 + intra ID dedup
         logger.info("Stage 1: Fetching from Semantic Scholar")
         fetch_results = fetch_all_categories(
             self._config,
-            self._dirs["raw_old"],
-            self._dirs["raw_new"],
+            search_queries,
+            self._dirs["raw"],
         )
+
+        # Build multi-query membership map before inter-ID dedup discards duplicates.
+        membership: dict[str, set[str]] = {}
+        for sq in search_queries:
+            for paper in fetch_results[sq.id]["papers"]:
+                pid = paper.get("paperId")
+                if pid:
+                    membership.setdefault(pid, set()).add(sq.id)
 
         # Stage 2: Inter ID dedup
         logger.info("Stage 2: Inter-category ID deduplication")
-        intra_deduped = {cat: fetch_results[cat]["papers"] for cat in category_order}
+        intra_deduped = {sq.id: fetch_results[sq.id]["papers"] for sq in search_queries}
         assigned_id = id_dedup_inter(intra_deduped)
         acquisition_stats: dict[str, dict] = {}
 
-        for cat in category_order:
-            raw_old_count = fetch_results[cat]["raw_old_count"]
-            raw_new_count = fetch_results[cat]["raw_new_count"]
-            intra_dupes   = fetch_results[cat]["intra_dupes"]
-            after_intra   = len(fetch_results[cat]["papers"])
-            final_papers  = assigned_id[cat]["papers"]
-            inter_removed = assigned_id[cat]["inter_removed"]
+        for sq in search_queries:
+            raw_count    = fetch_results[sq.id]["raw_count"]
+            intra_dupes  = fetch_results[sq.id]["intra_dupes"]
+            after_intra  = len(fetch_results[sq.id]["papers"])
+            final_papers = assigned_id[sq.id]["papers"]
+            inter_removed = assigned_id[sq.id]["inter_removed"]
 
-            _save_json(final_papers, self._dirs["final"] / f"{cat}.json")
+            _save_json(final_papers, self._dirs["final"] / f"{sq.id}.json")
 
-            acquisition_stats[cat] = {
-                "raw_old":      raw_old_count,
-                "raw_new":      raw_new_count,
-                "raw":          raw_old_count + raw_new_count,
-                "intra_dupes":  intra_dupes,
-                "after_intra":  after_intra,
+            acquisition_stats[sq.id] = {
+                "raw":           raw_count,
+                "intra_dupes":   intra_dupes,
+                "after_intra":   after_intra,
                 "inter_removed": inter_removed,
-                "final_unique": len(final_papers),
+                "final_unique":  len(final_papers),
             }
 
         print_acquisition_report(acquisition_stats, str(self._dirs["final"]))
         save_stats_json(
             {
-                "generated_at":    datetime.now().isoformat(),
-                "date_filter_old": self._config.semantic_scholar.date_filter_old,
-                "date_filter_new": self._config.semantic_scholar.date_filter_new,
-                "min_citation_old": self._config.semantic_scholar.min_citation_old,
-                "min_citation_new": self._config.semantic_scholar.min_citation_new,
-                "categories":      acquisition_stats,
+                "generated_at": datetime.now().isoformat(),
+                "queries":      {sq.id: sq.ss_params for sq in search_queries},
+                "categories":   acquisition_stats,
             },
             self._dirs["reports"] / "acquisition_stats.json",
         )
@@ -170,28 +201,46 @@ class MetadataOrchestrator:
         # Stage 3: Title dedup
         logger.info("Stage 3: Title-based deduplication")
         title_input: dict[str, list[dict]] = {
-            cat: assigned_id[cat]["papers"] for cat in category_order
+            sq.id: assigned_id[sq.id]["papers"] for sq in search_queries
         }
         intra_title_data: dict[str, list[dict]] = {}
         all_intra_rows: list[dict] = []
         title_stats: dict[str, dict] = {}
 
-        for cat in category_order:
-            unique, intra_rows = deduplicate_intra_title(title_input[cat], cat)
-            intra_title_data[cat] = unique
+        all_intra_merge: dict[str, list[str]] = {}
+        for sq in search_queries:
+            unique, intra_rows, intra_merge = deduplicate_intra_title(title_input[sq.id], sq.id)
+            intra_title_data[sq.id] = unique
             all_intra_rows.extend(intra_rows)
-            title_stats[cat] = {
-                "input":         len(title_input[cat]),
-                "intra_removed": len(title_input[cat]) - len(unique),
+            for kept_pid, dropped_pids in intra_merge.items():
+                all_intra_merge.setdefault(kept_pid, []).extend(dropped_pids)
+            title_stats[sq.id] = {
+                "input":         len(title_input[sq.id]),
+                "intra_removed": len(title_input[sq.id]) - len(unique),
                 "after_intra":   len(unique),
             }
 
-        assigned_title, inter_rows, inter_dropped = deduplicate_inter_title(intra_title_data)
+        assigned_title, inter_rows, inter_dropped, inter_merge = deduplicate_inter_title(intra_title_data)
 
-        for cat, papers in assigned_title.items():
-            _save_json(papers, self._dirs["final_title_deduped"] / f"{cat}.json")
-            title_stats[cat]["inter_removed"] = title_stats[cat]["after_intra"] - len(papers)
-            title_stats[cat]["final_unique"]  = len(papers)
+        for kept_pid, dropped_pids in all_intra_merge.items():
+            for dropped_pid in dropped_pids:
+                if dropped_pid:
+                    membership.setdefault(kept_pid, set()).update(
+                        membership.get(dropped_pid, set())
+                    )
+
+        for kept_pid, dropped_pids in inter_merge.items():
+            for dropped_pid in dropped_pids:
+                if dropped_pid:
+                    membership.setdefault(kept_pid, set()).update(
+                        membership.get(dropped_pid, set())
+                    )
+
+        for sq in search_queries:
+            papers = assigned_title[sq.id]
+            _save_json(papers, self._dirs["final_title_deduped"] / f"{sq.id}.json")
+            title_stats[sq.id]["inter_removed"] = title_stats[sq.id]["after_intra"] - len(papers)
+            title_stats[sq.id]["final_unique"]  = len(papers)
 
         total_intra_dropped = sum(s["intra_removed"] for s in title_stats.values())
 
@@ -199,7 +248,7 @@ class MetadataOrchestrator:
         save_csv(inter_rows,     self._dirs["reports"] / "inter_title_duplicates.csv", _INTER_CSV_FIELDS)
         save_stats_json(
             {
-                "generated_at":      datetime.now().isoformat(),
+                "generated_at":        datetime.now().isoformat(),
                 "total_intra_removed": total_intra_dropped,
                 "total_inter_removed": inter_dropped,
                 "total_removed":       total_intra_dropped + inter_dropped,
@@ -237,6 +286,87 @@ class MetadataOrchestrator:
                 self._dirs["publisher_scraped"],
             )
 
+        run_manifest["completed_at"] = datetime.now().isoformat()
+        run_manifest["status"] = "complete"
+        run_manifest["counts"] = {
+            sq.id: {
+                "raw":   acquisition_stats[sq.id]["raw"],
+                "final": title_stats[sq.id].get("final_unique", 0),
+            }
+            for sq in search_queries
+        }
+        _save_json(run_manifest, self._run_root / "run.json")
+
+        return self._emit_keyword_bundle(
+            search_queries=search_queries,
+            membership=membership,
+            acquisition_stats=acquisition_stats,
+            title_stats=title_stats,
+            rc=rc,
+        )
+
+    def _emit_keyword_bundle(
+        self,
+        *,
+        search_queries: list[SearchQuery],
+        membership: dict[str, set[str]],
+        acquisition_stats: dict[str, dict],
+        title_stats: dict[str, dict],
+        rc,
+    ) -> Path:
+        from ..export.seer_bundle import get_library_version, write_bundle
+
+        best_dir = (
+            self._dirs["publisher_scraped"] if rc.run_scrape_recovery else
+            self._dirs["final_recovered_abstract"] if rc.run_api_recovery else
+            self._dirs["final_title_deduped"]
+        )
+
+        flat_papers: list[dict] = []
+        for sq in search_queries:
+            cat_file = best_dir / f"{sq.id}.json"
+            if not cat_file.exists():
+                logger.warning("Bundle: category file not found, skipping: %s", cat_file)
+                continue
+            for paper in _load_json(cat_file):
+                pid = paper.get("paperId")
+                matched = sorted(membership.get(pid, {sq.id})) if pid else [sq.id]
+                paper["_provenance"] = {
+                    "matched_queries": matched,
+                    "seed_paper_id":   None,
+                    "edge_type":       None,
+                    "is_influential":  None,
+                    "input_id":        None,
+                    "fetch_status":    None,
+                }
+                flat_papers.append(paper)
+
+        per_query_counts = {
+            sq.id: {
+                "raw":   acquisition_stats[sq.id]["raw"],
+                "final": title_stats[sq.id].get("final_unique", 0),
+            }
+            for sq in search_queries
+        }
+
+        manifest_extra = {
+            "queries":      {sq.id: sq.query for sq in search_queries},
+            "seeds":        [],
+            "fetch_params": {sq.id: sq.ss_params for sq in search_queries},
+            "source_label": rc.source_label,
+            "counts":       {"per_query": per_query_counts},
+        }
+
+        bundle_dir = self._dirs["seer_ingest"]
+        write_bundle(
+            bundle_dir,
+            run_type="keyword_search",
+            papers=flat_papers,
+            manifest_extra=manifest_extra,
+            library_version=get_library_version(),
+        )
+        logger.info("SEER ingest bundle written to %s", bundle_dir)
+        return bundle_dir
 
     def _run_api_recovery(
         self,
@@ -276,8 +406,8 @@ class MetadataOrchestrator:
             start_time = time.time()
 
             for idx, paper in enumerate(missing, start=1):
-                paper_start = time.time()
-                result      = provider.recover(paper)
+                paper_start   = time.time()
+                result        = provider.recover(paper)
                 elapsed_paper = time.time() - paper_start
                 elapsed_total = time.time() - start_time
                 avg_per_paper = elapsed_total / idx

@@ -14,15 +14,6 @@ from .models import (
     SemanticScholarConfig,
 )
 
-_REQUIRED_SS_FIELDS = [
-    "date_filter_old",
-    "date_filter_new",
-    "min_citation_old",
-    "min_citation_new",
-    "publication_types",
-    "fields",
-]
-
 _REQUIRED_RECOVERY_FIELDS = [
     "similarity_threshold",
     "min_abstract_len",
@@ -59,18 +50,12 @@ def load_config(config_path: str | Path) -> MetadataConfig:
     ss_key_env = ss_raw.get("api_key_env", "SEMANTIC_SCHOLAR_API_KEY")
     core_key_env = recovery_raw.get("core_api_key_env", "CORE_API_KEY")
 
-    # max_results accepts null in JSON (→ None) or a positive integer.
     _cg_max = cg_raw.get("max_results", None)
     if _cg_max is not None:
         _cg_max = int(_cg_max)
 
     return MetadataConfig(
         semantic_scholar=SemanticScholarConfig(
-            date_filter_old=ss_raw["date_filter_old"],
-            date_filter_new=ss_raw["date_filter_new"],
-            min_citation_old=int(ss_raw["min_citation_old"]),
-            min_citation_new=int(ss_raw["min_citation_new"]),
-            publication_types=ss_raw["publication_types"],
             fields=ss_raw["fields"],
         ),
         recovery=RecoveryConfig(
@@ -102,19 +87,24 @@ def load_config(config_path: str | Path) -> MetadataConfig:
 
 
 def _validate_raw(raw: dict, config_path: Path) -> None:
-    for section, required_fields in [
-        ("semantic_scholar", _REQUIRED_SS_FIELDS),
-        ("recovery", _REQUIRED_RECOVERY_FIELDS),
-    ]:
-        if section not in raw:
+    if "semantic_scholar" not in raw:
+        raise ValueError(
+            f"config.json missing required section 'semantic_scholar' (path: {config_path})"
+        )
+    if "fields" not in raw["semantic_scholar"]:
+        raise ValueError(
+            f"config.json missing required key 'semantic_scholar.fields' (path: {config_path})"
+        )
+
+    if "recovery" not in raw:
+        raise ValueError(
+            f"config.json missing required section 'recovery' (path: {config_path})"
+        )
+    for key in _REQUIRED_RECOVERY_FIELDS:
+        if key not in raw["recovery"]:
             raise ValueError(
-                f"config.json missing required section '{section}' (path: {config_path})"
+                f"config.json missing required key 'recovery.{key}' (path: {config_path})"
             )
-        for key in required_fields:
-            if key not in raw[section]:
-                raise ValueError(
-                    f"config.json missing required key '{section}.{key}' (path: {config_path})"
-                )
 
     if "output" not in raw or "base_dir" not in raw["output"]:
         raise ValueError(
