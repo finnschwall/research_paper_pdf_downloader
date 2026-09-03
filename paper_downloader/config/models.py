@@ -25,10 +25,16 @@ class ResolutionConfig:
     allow_title_fallback: bool = True
     title_similarity_threshold: float = 0.90
 
+    # Stop querying further providers once one has already produced a candidate good
+    # enough that no later provider could outrank it: a direct .pdf link, on a trusted
+    # host, scoring at or above stop_confidence_threshold. Without this every paper pays
+    # for all twelve providers even when the first one hands back an arXiv PDF URL.
+    stop_when_confident: bool = True
+    stop_confidence_threshold: float = 0.75
+
     source_priority: list[str] = field(
         default_factory=lambda: [
             "metadata_open_access",
-            "venue_exact",
             "arxiv",
             "acl",
             "cvf",
@@ -84,6 +90,13 @@ class DownloadConfig:
     min_pdf_bytes: int = 1024
     max_pdf_bytes: int = 250_000_000
     user_agent: str = "paper-downloader/1.0"
+
+    # When a candidate URL turns out to serve HTML rather than a PDF, parse that page for
+    # a link to the actual PDF (citation_pdf_url meta tag, OJS download link, same-host
+    # .pdf anchor) and try it once. Most "gold OA" DOIs point at a landing page, not a file.
+    landing_page_fallback: bool = True
+    landing_page_max_bytes: int = 2_000_000
+
     allowed_content_types: list[str] = field(
         default_factory=lambda: [
             "application/pdf",

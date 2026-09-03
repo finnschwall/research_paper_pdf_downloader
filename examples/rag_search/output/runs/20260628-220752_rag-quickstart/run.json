@@ -1,0 +1,18 @@
+{
+  "run_id": "20260628-220752_rag-quickstart",
+  "label": "rag-quickstart",
+  "started_at": "2026-06-28T22:07:52.141340",
+  "completed_at": "2026-06-28T22:08:01.253060",
+  "status": "complete",
+  "search_queries_file": "/home/ies/schwall/sysreview/research_paper_pdf_downloader/examples/rag_search/search_queries.json",
+  "stages": {
+    "api_recovery": false,
+    "scrape_recovery": false
+  },
+  "counts": {
+    "1_rag_methods": {
+      "raw": 2053,
+      "final": 2051
+    }
+  }
+}

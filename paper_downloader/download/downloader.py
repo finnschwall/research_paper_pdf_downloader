@@ -1,14 +1,47 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import requests
 
 from paper_downloader.config.models import DownloadConfig
-from paper_downloader.core.exceptions import DownloadError, PDFValidationError
+from paper_downloader.core import host_gate
+from paper_downloader.core.exceptions import (
+    DownloadError,
+    HostBlockedError,
+    HTTPStatusError,
+    NotAPDFError,
+    PDFValidationError,
+)
 from paper_downloader.storage.writers import ensure_parent_dir
+
+logger = logging.getLogger("paper_downloader")
+
+# Statuses worth trying again: the server is overloaded, rate limiting, or briefly broken.
+# 401/403/404 are answers, not glitches -- retrying them only wastes time and looks worse
+# to the publisher.
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504, 507, 509})
+
+#: How much of an error response to read before deciding whether it is a refusal page.
+_ERROR_BODY_PEEK_BYTES = 64 * 1024
+
+
+def _retry_after_seconds(response: requests.Response) -> float:
+    """`Retry-After` in seconds, or a conservative default when it is absent or a date.
+
+    Only the delta-seconds form is parsed. The HTTP-date form is rare here and guessing at
+    clock skew to save a few seconds of waiting is not worth the code.
+    """
+    raw = (response.headers.get("Retry-After") or "").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 60.0
 
 
 @dataclass(slots=True)
@@ -34,8 +67,30 @@ class DownloadResult:
 
 
 class PDFDownloader:
-    def __init__(self, config: DownloadConfig) -> None:
+    """Fetches PDFs over one long-lived HTTP session.
+
+    The session is deliberately not per-attempt. A gold-OA DOI usually resolves to an
+    article page, so the real fetch is two requests -- landing page, then the PDF link on
+    it -- and several platforms set a cookie on the first that the second must present.
+    Nature answers a cookie-less PDF request with `?error=cookies_not_supported` and serves
+    the article HTML instead, which used to be recorded as "landing page had no PDF". Not
+    thread-safe, for the same reason `requests.Session` is not: give each thread its own.
+    """
+
+    def __init__(self, config: DownloadConfig, *, session: requests.Session | None = None) -> None:
         self.config = config
+        self._session = session if session is not None else host_gate.GatedSession()
+        self._owns_session = session is None
+
+    def close(self) -> None:
+        if self._owns_session:
+            self._session.close()
+
+    def __enter__(self) -> "PDFDownloader":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
 
     def download(
         self,
@@ -43,7 +98,14 @@ class PDFDownloader:
         output_path: str | Path,
         *,
         skip_if_valid: bool = True,
+        referer: str | None = None,
     ) -> DownloadResult:
+        """Fetch `url` into `output_path`, retrying only what is worth retrying.
+
+        `referer` is sent when we arrived at this URL from a landing page; several
+        platforms serve the PDF only to requests that look like they came from the
+        article page.
+        """
         target_path = Path(output_path)
 
         if skip_if_valid and target_path.exists():
@@ -59,25 +121,64 @@ class PDFDownloader:
                 reused_existing=True,
             )
 
+        host_gate.check_blocked(url)
+
         ensure_parent_dir(target_path)
         tmp_path = target_path.with_suffix(target_path.suffix + ".part")
 
-        try:
-            with requests.Session() as session:
-                session.headers.update(self._request_headers(url))
-                try:
-                    response = session.get(
-                        url,
-                        stream=True,
-                        timeout=(self.config.connect_timeout_seconds, self.config.read_timeout_seconds),
-                        allow_redirects=True,
-                        verify=self.config.verify_ssl,
-                    )
-                except requests.RequestException as exc:
-                    raise DownloadError(f"Failed to download PDF from url: {url}") from exc
+        # config.max_retries counts retries, so attempt 1 is not one of them.
+        attempts = max(1, self.config.max_retries + 1)
+        last_error: Exception | None = None
 
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._attempt_download(url, target_path, tmp_path, referer=referer)
+            except (NotAPDFError, PDFValidationError):
+                # The server gave us something, it just was not a PDF. Asking again gets
+                # the same thing back.
+                raise
+            except (HTTPStatusError, DownloadError) as exc:
+                last_error = exc
+                if not self._is_retryable(exc) or attempt == attempts:
+                    raise
+                delay = self.config.retry_backoff_seconds * (2 ** (attempt - 1))
+                logger.info(
+                    "download attempt %d/%d failed (%s) | retrying in %.1fs | %s",
+                    attempt, attempts, exc, delay, url,
+                )
+                time.sleep(delay)
+
+        raise last_error or DownloadError(f"Failed to download PDF from url: {url}")
+
+    @staticmethod
+    def _is_retryable(exc: Exception) -> bool:
+        if isinstance(exc, HostBlockedError):
+            # The host is turning us away at the edge. Asking four times is how the block
+            # got there in the first place.
+            return False
+        if isinstance(exc, HTTPStatusError):
+            return exc.status_code in _RETRYABLE_STATUSES
+        # A bare DownloadError here means the request never completed -- DNS, connect
+        # timeout, read timeout, reset connection. All worth one more try.
+        return True
+
+    def _attempt_download(
+        self,
+        url: str,
+        target_path: Path,
+        tmp_path: Path,
+        *,
+        referer: str | None = None,
+    ) -> DownloadResult:
+        try:
+            # Headers go per-request, not onto the session: the session outlives this URL
+            # and `_request_headers` is domain-specific, so mutating it here would send one
+            # publisher's browser disguise to the next one.
+            with contextlib.closing(
+                self._get(url, referer=referer)
+            ) as response:
                 if response.status_code >= 400:
-                    raise DownloadError(f"Download returned HTTP {response.status_code} for url: {url}")
+                    self._raise_for_error_status(url, response)
 
                 content_type = response.headers.get("Content-Type")
                 final_url = str(response.url)
@@ -103,20 +204,39 @@ class PDFDownloader:
                             sha256.update(chunk)
                             handle.write(chunk)
                 except Exception:
-                    if tmp_path.exists():
-                        tmp_path.unlink(missing_ok=True)
+                    tmp_path.unlink(missing_ok=True)
                     raise
+
+                # An empty 2xx that is not a 200 is a bot challenge, not a document: IEEE
+                # answers every article URL with a 202 and no body. Without this the file
+                # merely fails the size check, and "too small to be a valid PDF" says
+                # nothing about why.
+                if total_bytes == 0 and response.status_code != 200:
+                    tmp_path.unlink(missing_ok=True)
+                    if host_gate.note_response(url, response.status_code, b""):
+                        raise HostBlockedError(
+                            f"{host_gate.host_key(url)} answered HTTP "
+                            f"{response.status_code} with an empty body for: {url}",
+                            host=host_gate.host_key(url),
+                        )
         except (DownloadError, PDFValidationError):
             raise
         except Exception as exc:
             raise DownloadError(f"Failed to download PDF from url: {url}") from exc
 
-        self._validate_downloaded_file(
-            tmp_path,
-            content_type=content_type,
-            first_bytes=first_bytes,
-            size_bytes=total_bytes,
-        )
+        try:
+            self._validate_downloaded_file(
+                tmp_path,
+                content_type=content_type,
+                first_bytes=first_bytes,
+                size_bytes=total_bytes,
+                final_url=final_url,
+            )
+        except Exception:
+            # Never leave a .part behind: the next run would otherwise find stale bytes,
+            # and a half-written HTML page under a .pdf name is actively confusing.
+            tmp_path.unlink(missing_ok=True)
+            raise
 
         tmp_path.replace(target_path)
 
@@ -130,6 +250,49 @@ class PDFDownloader:
             reused_existing=False,
         )
 
+    def _get(self, url: str, *, referer: str | None) -> requests.Response:
+        try:
+            return self._session.get(
+                url,
+                headers=self._request_headers(url, referer=referer),
+                stream=True,
+                timeout=(self.config.connect_timeout_seconds, self.config.read_timeout_seconds),
+                allow_redirects=True,
+                verify=self.config.verify_ssl,
+            )
+        except requests.RequestException as exc:
+            raise DownloadError(f"Failed to download PDF from url: {url}") from exc
+
+    def _raise_for_error_status(self, url: str, response: requests.Response) -> None:
+        """Turn an error status into the most specific exception the body supports.
+
+        The body is read here -- bounded, and it was going to be discarded anyway --
+        because the difference between "this article is not free" and "this site is turning
+        our IP away" is only visible in it. The first is an answer about the paper; the
+        second is an answer about us, and conflating them is how a temporary block became a
+        permanent verdict on 36 papers.
+        """
+        peek = b""
+        try:
+            peek = next(response.iter_content(chunk_size=_ERROR_BODY_PEEK_BYTES), b"") or b""
+        except Exception:
+            pass
+
+        if response.status_code == 429:
+            host_gate.note_retry_after(url, _retry_after_seconds(response))
+
+        if host_gate.note_response(url, response.status_code, peek):
+            raise HostBlockedError(
+                f"{host_gate.host_key(url)} refused this server with HTTP "
+                f"{response.status_code} for: {url}",
+                host=host_gate.host_key(url),
+            )
+
+        raise HTTPStatusError(
+            f"Download returned HTTP {response.status_code} for url: {url}",
+            status_code=response.status_code,
+        )
+
     def _domain_from_url(self, url: str) -> str:
         try:
             from urllib.parse import urlparse
@@ -140,7 +303,7 @@ class PDFDownloader:
         except Exception:
             return ""
 
-    def _request_headers(self, url: str) -> dict[str, str]:
+    def _request_headers(self, url: str, *, referer: str | None = None) -> dict[str, str]:
         """
         Return HTTP headers appropriate for the target domain.
         """
@@ -166,6 +329,19 @@ class PDFDownloader:
             "hindawi.com",
             "onlinelibrary.wiley.com",
             "wiley.com",
+            # Added after a production run: these all answered the default
+            # "paper-downloader/1.0" agent with 403 or with an HTML interstitial.
+            "aacrjournals.org",
+            "emerald.com",
+            "dl.acm.org",
+            "ieeexplore.ieee.org",
+            "link.springer.com",
+            "springer.com",
+            "tandfonline.com",
+            "sagepub.com",
+            "journals.sagepub.com",
+            "scitepress.org",
+            "researchcommons.org",
         })
 
         domain = self._domain_from_url(url)
@@ -175,18 +351,26 @@ class PDFDownloader:
         )
 
         if needs_browser_ua:
-            return {
+            headers = {
                 "User-Agent": _BROWSER_UA,
                 "Accept": _BROWSER_ACCEPT,
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate, br",
                 "Connection": "keep-alive",
             }
+        else:
+            headers = {
+                "User-Agent": self.config.user_agent,
+                "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+            }
 
-        return {
-            "User-Agent": self.config.user_agent,
-            "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
-        }
+        # Sent only when we followed a link from an article page. Several platforms serve
+        # the PDF to a request that looks like it came from their own landing page and
+        # refuse an otherwise identical one that does not.
+        if referer:
+            headers["Referer"] = referer
+
+        return headers
 
     def _validate_existing_file(self, path: Path, *, size_bytes: int) -> None:
         if size_bytes < self.config.min_pdf_bytes:
@@ -203,6 +387,7 @@ class PDFDownloader:
         content_type: str | None,
         first_bytes: bytes,
         size_bytes: int,
+        final_url: str = "",
     ) -> None:
         if size_bytes < self.config.min_pdf_bytes:
             raise PDFValidationError(
@@ -210,15 +395,36 @@ class PDFDownloader:
             )
 
         if not self._looks_like_pdf(first_bytes):
-            raise PDFValidationError(f"Downloaded file does not look like a PDF: {path}")
+            raise NotAPDFError(
+                f"Downloaded file does not look like a PDF: {path}",
+                final_url=final_url,
+                body=self._read_page_text(path),
+            )
 
         if content_type:
             lowered = content_type.split(";")[0].strip().lower()
             allowed = {item.lower() for item in self.config.allowed_content_types}
             if lowered not in allowed and not lowered.endswith("/pdf"):
-                raise PDFValidationError(
-                    f"Server returned unexpected content type '{lowered}' for url: {path}"
+                raise NotAPDFError(
+                    f"Server returned unexpected content type '{lowered}' for url: {path}",
+                    final_url=final_url,
+                    body=self._read_page_text(path),
                 )
+
+    def _read_page_text(self, path: Path) -> str:
+        """Read back what the server actually sent, as text, so the caller can scan it.
+
+        Bounded by landing_page_max_bytes -- we only need the <head> and the download
+        links, and some publishers answer with megabytes of JavaScript.
+        """
+        if not self.config.landing_page_fallback:
+            return ""
+        try:
+            with path.open("rb") as handle:
+                raw = handle.read(self.config.landing_page_max_bytes)
+        except OSError:
+            return ""
+        return raw.decode("utf-8", errors="replace")
 
     def _looks_like_pdf(self, first_bytes: bytes) -> bool:
         return first_bytes.startswith(b"%PDF-")

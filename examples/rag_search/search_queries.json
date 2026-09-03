@@ -1,0 +1,19 @@
+{
+  "defaults": {
+    "date_range": "2025-01-01:",
+    "min_citations": 3,
+    "publication_types": "JournalArticle,Conference,Study"
+  },
+  "queries": {
+    "1_rag_methods": {
+      "query": "(\"retrieval-augmented generation\" | \"retrieval augmented generation\" | RAG | \"dense retrieval\" | \"retrieve and generate\") + (LLM | \"large language model\" | transformer | GPT | llama | mistral)"
+    },
+    "2_rag_evaluation": {
+      "query": "(\"RAG evaluation\" | \"retrieval augmented generation\" + (benchmark | evaluation | metric | faithfulness | hallucination | groundedness)) + (LLM | \"large language model\")",
+      "min_citations": 1
+    },
+    "3_rag_applications": {
+      "query": "(\"retrieval-augmented\" | \"retrieval augmented\") + (\"question answering\" | \"open-domain QA\" | \"knowledge-intensive\" | \"fact verification\" | \"knowledge base\")"
+    }
+  }
+}

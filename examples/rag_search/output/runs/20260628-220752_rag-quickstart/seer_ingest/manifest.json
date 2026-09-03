@@ -1,0 +1,29 @@
+{
+  "schema_version": "1.0",
+  "pipeline": "paper_metadata",
+  "library_version": "e441100",
+  "generated_at": "2026-06-28T20:08:01Z",
+  "run_type": "keyword_search",
+  "source_label": "rag-quickstart",
+  "fetch_params": {
+    "1_rag_methods": {
+      "publicationDateOrYear": "2025-01-01:",
+      "minCitationCount": 3,
+      "publicationTypes": "JournalArticle,Conference,Study"
+    }
+  },
+  "queries": {
+    "1_rag_methods": "(\"retrieval-augmented generation\" | \"retrieval augmented generation\" | RAG | \"dense retrieval\" | \"retrieve and generate\") + (LLM | \"large language model\" | transformer | GPT | llama | mistral)"
+  },
+  "seeds": [],
+  "counts": {
+    "per_query": {
+      "1_rag_methods": {
+        "raw": 2053,
+        "final": 2051
+      }
+    },
+    "total_unique_papers": 2051
+  },
+  "papers_file": "papers.json"
+}

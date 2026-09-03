@@ -101,6 +101,18 @@ Both loaders fall back to searching upward from the current working directory wh
 
 The `config.json` file controls all pipeline behaviour.
 
+**Fields worth knowing about:**
+
+| Field | What it controls |
+|---|---|
+| `resolution.source_priority` | Which source providers run, and in what order. This is an **enable list**: a provider whose name is not here is never constructed, so it costs nothing. Names with no implementation are skipped with a warning. |
+| `resolution.stop_when_confident` | Stop querying further providers once one has returned a direct PDF link on a trusted host scoring at or above `stop_confidence_threshold`. With `prefer_publisher_version` on, only a publisher-version candidate can end the search, so preprint-only papers still consult every provider. Default on. |
+| `download.max_retries` / `retry_backoff_seconds` | Retries per candidate URL, with exponential backoff. Applied only to failures that could go the other way next time — connection errors, timeouts, 429, 5xx. A 401/403/404 is an answer, not a glitch, and is never retried. |
+| `download.landing_page_fallback` | When a candidate URL serves HTML instead of a PDF, parse that page for the real PDF link (`citation_pdf_url` meta tag, OJS download link, same-host `.pdf` anchor) and try it once. Most gold-OA DOIs point at an article page rather than a file, so this is the difference between "no PDF" and the PDF. Default on. |
+| `download.landing_page_max_bytes` | How much of such a page to read back before scanning it. |
+
+**A note on speed.** `broad_search` queries DuckDuckGo once per trusted domain. If DuckDuckGo is unreachable from your network — some institutions block or sinkhole it — each of those queries costs a full `connect_timeout_seconds`, which can dominate the runtime of every paper. Drop `broad_search` from `source_priority` if so.
+
 ---
 
 ### paper_metadata config.json
@@ -858,6 +870,21 @@ for r in results:
         print(r.status, r.error)
 ```
 
+### Walking a list one paper at a time
+
+`download()` builds a fresh orchestrator per call — twelve provider HTTP sessions, a Semantic Scholar client, and a re-read of `config.json`. That is wasted work if you are looping over papers to record progress after each one. Open the downloader once instead:
+
+```python
+from paper_data import open_downloader
+
+with open_downloader(config=cfg) as dl:
+    for paper_id in ids:
+        result = dl.download_one(paper_id)
+        record(result)          # your own progress reporting
+```
+
+The handle is **not** thread-safe: the providers hold `requests.Session` objects, which must not be shared across threads. For parallelism, open one handle per thread — the sessions are ones that thread needed anyway.
+
 ---
 
 ## Troubleshooting
@@ -868,7 +895,11 @@ This means all 11 providers returned no downloadable PDF for that paper. Common 
 
 **The pipeline is slow**
 
-The pipeline processes papers sequentially. Each paper queries multiple external APIs in sequence. The primary factors affecting speed are network latency to the API servers and whether rate limiting causes backoff delays. Providing API keys (particularly for Semantic Scholar and CORE) significantly reduces rate-limiting delays. If your input contains only papers with ArXiv IDs, most papers resolve in one or two provider calls and are fast.
+The pipeline processes papers sequentially, and each paper queries external APIs in sequence, so runtime is dominated by network latency and by any rate-limiting backoff.
+
+Check the obvious culprit first: **is every paper taking about the same suspiciously long time?** That is the signature of a provider whose host you cannot reach, since a blocked host costs a full `connect_timeout_seconds` rather than failing fast. `broad_search` is the usual one — it makes eight DuckDuckGo queries per paper, and if DuckDuckGo is blocked on your network that is eight connect timeouts, every paper, contributing nothing. Drop it from `resolution.source_priority`.
+
+Otherwise: provide API keys (Semantic Scholar and CORE especially) to reduce rate-limiting delays, keep `resolution.stop_when_confident` on, and note that papers with ArXiv IDs resolve in one or two provider calls and are fast.
 
 **Import errors after installation**
 

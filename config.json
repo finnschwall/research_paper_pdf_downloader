@@ -9,7 +9,6 @@
     "title_similarity_threshold": 0.9,
     "source_priority": [
       "metadata_open_access",
-      "venue_exact",
       "arxiv",
       "acl",
       "cvf",

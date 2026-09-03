@@ -1,0 +1,19 @@
+{
+  "generated_at": "2026-06-28T22:08:00.911147",
+  "queries": {
+    "1_rag_methods": {
+      "publicationDateOrYear": "2025-01-01:",
+      "minCitationCount": 3,
+      "publicationTypes": "JournalArticle,Conference,Study"
+    }
+  },
+  "categories": {
+    "1_rag_methods": {
+      "raw": 2053,
+      "intra_dupes": 0,
+      "after_intra": 2053,
+      "inter_removed": 0,
+      "final_unique": 2053
+    }
+  }
+}

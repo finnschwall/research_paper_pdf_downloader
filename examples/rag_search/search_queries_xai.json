@@ -1,0 +1,12 @@
+{
+  "defaults": {
+    "date_range": "2020-01-01:2025-01-01",
+    "min_citations": 5,
+    "publication_types": "JournalArticle,Conference,Dataset,Study"
+  },
+  "queries": {
+    "1_xai_llm": {
+      "query": "(\"explainable AI\" | XAI | explainability | interpretable | interpretability | \"feature attribution\" | \"saliency map\" | \"integrated gradients\" | SHAP | LIME | TCAV | PDP | counterfactuals | \"concept based\") + (LLM | LLMs | \"Large Language Model\" | \"Language Models\" | \"Vision Language Models\" | \"Vision Language Model\" | VLM | VLMs | gpt | llama | claude | gemma | qwen | mistral | mixtral | pythia | bert | roberta | t5 | deepseek | kimi | grok | llava | blip | cohere)"
+    }
+  }
+}

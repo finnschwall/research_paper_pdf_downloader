@@ -6,6 +6,8 @@ from urllib.parse import quote
 
 import requests
 
+from paper_downloader.core import host_gate
+
 from paper_downloader.config.models import DownloadConfig, ResolutionConfig
 from paper_downloader.models.paper import PaperRecord
 from paper_downloader.resolve.resolver import SourceCandidate, validate_title_match
@@ -35,7 +37,7 @@ class DOAJSourceProvider:
     _session: requests.Session = field(default=None, init=False, repr=False)  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
-        self._session = requests.Session()
+        self._session = host_gate.GatedSession()
         self._session.headers.update(self._headers())
 
     def __del__(self) -> None:

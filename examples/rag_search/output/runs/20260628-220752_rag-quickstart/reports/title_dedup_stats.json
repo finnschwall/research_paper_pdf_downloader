@@ -1,0 +1,15 @@
+{
+  "generated_at": "2026-06-28T22:08:01.252790",
+  "total_intra_removed": 2,
+  "total_inter_removed": 0,
+  "total_removed": 2,
+  "categories": {
+    "1_rag_methods": {
+      "input": 2053,
+      "intra_removed": 2,
+      "after_intra": 2051,
+      "inter_removed": 0,
+      "final_unique": 2051
+    }
+  }
+}

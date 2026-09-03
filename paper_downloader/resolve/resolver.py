@@ -226,6 +226,9 @@ class SourceResolver:
                 )
                 candidates.append(candidate)
 
+            if self._good_enough(candidates):
+                break
+
         if not candidates:
             error = ResolutionError(
                 f"No downloadable source candidate found for paper: {paper.paper_key}"
@@ -249,6 +252,32 @@ class SourceResolver:
             attempted_sources=attempted_sources,
             provider_attempts=provider_attempts,
         )
+
+    def _good_enough(self, candidates: list[SourceCandidate]) -> bool:
+        """Should we stop asking further providers?
+
+        Yes once some candidate is a direct link to a PDF, on a host we trust, scoring at
+        or above the threshold -- a later provider can at best point at the same file
+        somewhere else.
+
+        When prefer_publisher_version is on we additionally insist the candidate *is* the
+        publisher version, because that preference is precisely a reason to keep looking:
+        stopping at a preprint would quietly override the setting. That makes this a
+        no-op for preprint-only papers, which is the right trade -- the remaining
+        providers cost about a second, and correctness is worth more than that.
+        """
+        if not self.config.stop_when_confident:
+            return False
+        threshold = self.config.stop_confidence_threshold
+        for candidate in candidates:
+            if not candidate.is_direct_pdf or candidate.confidence < threshold:
+                continue
+            if not self._is_trusted_domain(candidate.domain):
+                continue
+            if self.config.prefer_publisher_version and candidate.version_type != "publisher":
+                continue
+            return True
+        return False
 
     def _sort_key(self, candidate: SourceCandidate) -> tuple[int, int, int, float]:
         return (

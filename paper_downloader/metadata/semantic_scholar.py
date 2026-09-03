@@ -6,6 +6,8 @@ from typing import Any
 
 import requests
 
+from paper_downloader.core import host_gate
+
 from paper_downloader.config.models import ApiConfig, DownloadConfig
 from paper_downloader.core.exceptions import MetadataError
 from paper_downloader.metadata.id_recovery import build_paper_key, recover_identifiers_from_record
@@ -56,7 +58,7 @@ class SemanticScholarClient:
         )
 
     def _session(self) -> requests.Session:
-        session = requests.Session()
+        session = host_gate.GatedSession()
         session.headers.update(self._headers())
         return session
 

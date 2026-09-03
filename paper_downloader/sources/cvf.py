@@ -7,6 +7,8 @@ from typing import Any
 
 import requests
 
+from paper_downloader.core import host_gate
+
 from paper_downloader.config.models import DownloadConfig, ResolutionConfig
 from paper_downloader.models.paper import PaperRecord
 from paper_downloader.resolve.resolver import SourceCandidate, validate_title_match
@@ -169,19 +171,23 @@ class CVFSourceProvider:
 
     def _fetch_text(self, url: str) -> str | None:
         try:
-            response = requests.get(
-                url,
-                headers={
-                    "User-Agent": self.download_config.user_agent,
-                    "Accept": "text/html,application/xhtml+xml",
-                },
-                timeout=(
-                    self.download_config.connect_timeout_seconds,
-                    self.download_config.read_timeout_seconds,
-                ),
-                allow_redirects=True,
-                verify=self.download_config.verify_ssl,
-            )
+            # A bare `requests.get` rather than a session, because a CVF provider exists
+            # per worker thread and a `requests.Session` is not safe to share -- so the
+            # host gate is applied here instead of by a GatedSession.
+            with host_gate.hold(url):
+                response = requests.get(
+                    url,
+                    headers={
+                        "User-Agent": self.download_config.user_agent,
+                        "Accept": "text/html,application/xhtml+xml",
+                    },
+                    timeout=(
+                        self.download_config.connect_timeout_seconds,
+                        self.download_config.read_timeout_seconds,
+                    ),
+                    allow_redirects=True,
+                    verify=self.download_config.verify_ssl,
+                )
         except requests.RequestException as exc:
             _logger.debug("cvf: fetch failed | url=%s | %s", url, exc)
             return None

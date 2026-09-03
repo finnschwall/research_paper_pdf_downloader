@@ -1,0 +1,13 @@
+{
+  "run_id": "20260629-230403_xai",
+  "label": "xai",
+  "started_at": "2026-06-29T23:04:03.079901",
+  "completed_at": null,
+  "status": "running",
+  "search_queries_file": "/home/ies/schwall/sysreview/research_paper_pdf_downloader/examples/rag_search/search_queries_xai.json",
+  "stages": {
+    "api_recovery": false,
+    "scrape_recovery": false
+  },
+  "counts": {}
+}

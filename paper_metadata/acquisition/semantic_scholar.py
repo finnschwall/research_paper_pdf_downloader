@@ -94,7 +94,7 @@ def preview_query(sq: SearchQuery, config: MetadataConfig) -> int:
         return 0
 
     if response.status_code == 429:
-        retry_after = int(response.headers.get("Retry-After", 10))
+        retry_after = int(response.headers.get("Retry-After", 5))
         logger.warning("[%s] Preview rate limited — sleeping %ds.", sq.id, retry_after)
         time.sleep(retry_after)
         return preview_query(sq, config)
@@ -117,6 +117,49 @@ def preview_all_queries(
         count = preview_query(sq, config)
         results[sq.id] = count
         logger.info("[%s] Preview: ~%d papers", sq.id, count)
+        if i < len(search_queries) - 1:
+            time.sleep(delay)
+    return results
+
+
+def sample_query(sq: "SearchQuery", config: "MetadataConfig", n: int = 20) -> list[dict]:
+    """Fetch first n papers for a query — one request, no pagination."""
+    ss = config.semantic_scholar
+    headers = {"x-api-key": config.ss_api_key} if config.ss_api_key else {}
+    fields = "paperId,title,abstract,year,citationCount,authors,venue"
+    params: dict = {"query": sq.query, "fields": fields, "limit": min(n, 100), **sq.ss_params}
+
+    try:
+        response = requests.get(ss.bulk_search_url, headers=headers, params=params, timeout=30)
+    except requests.RequestException as exc:
+        logger.error("[%s] Sample request failed: %s", sq.id, exc)
+        return []
+
+    if response.status_code == 429:
+        retry_after = int(response.headers.get("Retry-After", 5))
+        logger.warning("[%s] Sample rate limited — sleeping %ds.", sq.id, retry_after)
+        time.sleep(retry_after)
+        return sample_query(sq, config, n)
+
+    if response.status_code != 200:
+        logger.error("[%s] Sample API error %d: %s", sq.id, response.status_code, response.text[:200])
+        return []
+
+    return response.json().get("data", [])[:n]
+
+
+def sample_all_queries(
+    search_queries: list["SearchQuery"],
+    config: "MetadataConfig",
+    n: int = 20,
+) -> dict[str, list[dict]]:
+    """Return {query_id: [paper_dict, ...]} — first n papers per query, one request each."""
+    delay = config.recovery.request_delay
+    results: dict[str, list[dict]] = {}
+    for i, sq in enumerate(search_queries):
+        papers = sample_query(sq, config, n)
+        results[sq.id] = papers
+        logger.info("[%s] Sample: %d papers returned", sq.id, len(papers))
         if i < len(search_queries) - 1:
             time.sleep(delay)
     return results
@@ -184,7 +227,7 @@ def _run_paginated_query(config: MetadataConfig, sq: SearchQuery) -> list[dict]:
             break
 
         if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", 10))
+            retry_after = int(response.headers.get("Retry-After", 5))
             logger.warning("Rate limited. Sleeping %ds.", retry_after)
             time.sleep(retry_after)
             continue
@@ -279,7 +322,7 @@ def _fetch_batch_chunk(
             return [None] * len(ids)
 
         if response.status_code == 429:
-            wait = int(response.headers.get("Retry-After", 10))
+            wait = int(response.headers.get("Retry-After", 5))
             logger.warning(
                 "Rate limited on batch chunk — sleeping %ds (attempt %d/%d)",
                 wait, attempt + 1, max_retries,

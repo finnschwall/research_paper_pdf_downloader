@@ -6,13 +6,18 @@ from pathlib import Path
 from typing import Any, Callable
 
 from paper_downloader.config.models import PipelineConfig
+from paper_downloader.core import host_gate
 from paper_downloader.core.exceptions import (
+    ConfigurationError,
     DownloadError,
+    HostBlockedError,
     MetadataError,
+    NotAPDFError,
     ResolutionError,
 )
 from paper_downloader.core.stages import PipelineStage
 from paper_downloader.download.downloader import PDFDownloader, DownloadResult
+from paper_downloader.download.landing_page import extract_pdf_url
 from paper_downloader.inputs.parser import parse_inputs
 from paper_downloader.metadata.semantic_scholar import SemanticScholarClient
 from paper_downloader.models.manifest import PipelineManifest
@@ -113,22 +118,50 @@ class DownloadOrchestrator:
             resolver = self._build_resolver(config)
         self.resolver = resolver
 
+    def close(self) -> None:
+        """Release the downloader's HTTP session. Safe to call more than once."""
+        closer = getattr(self.downloader, "close", None)
+        if callable(closer):
+            closer()
+
     @staticmethod
     def _build_resolver(config: PipelineConfig) -> SourceResolver:
-        providers = [
-            MetadataOpenAccessProvider(),
-            ACLSourceProvider(),
-            CVFSourceProvider(config.download, config.resolution),
-            ArxivSourceProvider(),
-            OpenAlexSourceProvider(config.apis, config.download, config.resolution),
-            UnpaywallSourceProvider(config.apis, config.download, config.resolution),
-            EuropePMCSourceProvider(config.download, config.resolution),
-            CrossrefSourceProvider(config.apis, config.download, config.resolution),
-            CORESourceProvider(config.apis, config.download, config.resolution),
-            ZenodoSourceProvider(config.download, config.resolution),
-            DOAJSourceProvider(config.download, config.resolution),
-            BroadSearchSourceProvider(config.download, config.resolution),
-        ]
+        """Build the provider chain named by `resolution.source_priority`.
+
+        The config key already existed but was ignored, so turning a provider off meant
+        editing this function. It is now the enable list *and* the order: drop a name and
+        that provider is never constructed, so it costs nothing. Names not listed here are
+        ignored with a warning rather than failing the run -- `venue_exact` appears in the
+        shipped default and has no implementation.
+        """
+        builders: dict[str, Callable[[], Any]] = {
+            "metadata_open_access": MetadataOpenAccessProvider,
+            "acl": ACLSourceProvider,
+            "cvf": lambda: CVFSourceProvider(config.download, config.resolution),
+            "arxiv": ArxivSourceProvider,
+            "openalex": lambda: OpenAlexSourceProvider(config.apis, config.download, config.resolution),
+            "unpaywall": lambda: UnpaywallSourceProvider(config.apis, config.download, config.resolution),
+            "europepmc": lambda: EuropePMCSourceProvider(config.download, config.resolution),
+            "crossref": lambda: CrossrefSourceProvider(config.apis, config.download, config.resolution),
+            "core": lambda: CORESourceProvider(config.apis, config.download, config.resolution),
+            "zenodo": lambda: ZenodoSourceProvider(config.download, config.resolution),
+            "doaj": lambda: DOAJSourceProvider(config.download, config.resolution),
+            "broad_search": lambda: BroadSearchSourceProvider(config.download, config.resolution),
+        }
+
+        logger = logging.getLogger("paper_downloader")
+        providers = []
+        for name in config.resolution.source_priority:
+            builder = builders.get(name)
+            if builder is None:
+                logger.warning("resolution.source_priority names unknown provider %r -- skipped", name)
+                continue
+            providers.append(builder())
+
+        if not providers:
+            raise ConfigurationError(
+                "resolution.source_priority named no known providers; nothing to resolve with"
+            )
         return SourceResolver(config.resolution, providers=providers)
 
     def process_inputs(
@@ -505,16 +538,22 @@ class DownloadOrchestrator:
                 index, total, self._ref(paper),
                 f"trying candidate {candidate_index}/{len(resolution.all_candidates)} | {candidate.source_name} | {candidate.pdf_url}",
             )
+            attempted_url = candidate.pdf_url
             try:
-                result = self.downloader.download(
-                    candidate.pdf_url,
-                    output_pdf_path,
-                    skip_if_valid=self.config.resume.verify_existing_files,
-                )
+                try:
+                    result = self.downloader.download(
+                        candidate.pdf_url,
+                        output_pdf_path,
+                        skip_if_valid=self.config.resume.verify_existing_files,
+                    )
+                except NotAPDFError as exc:
+                    result, attempted_url = self._retry_via_landing_page(
+                        exc, candidate, output_pdf_path, index=index, total=total, paper=paper,
+                    )
                 attempts.append({
                     "candidate_index": candidate_index,
                     "source_name": candidate.source_name,
-                    "pdf_url": candidate.pdf_url,
+                    "pdf_url": attempted_url,
                     "status": "succeeded",
                     "error": None,
                     "result": result.to_dict(),
@@ -541,9 +580,16 @@ class DownloadOrchestrator:
                 attempts.append({
                     "candidate_index": candidate_index,
                     "source_name": candidate.source_name,
-                    "pdf_url": candidate.pdf_url,
+                    "pdf_url": attempted_url,
                     "status": "failed",
                     "error": str(exc),
+                    "http_status": getattr(exc, "status_code", None),
+                    "not_a_pdf": isinstance(exc, NotAPDFError),
+                    # Whether the host turned this server away rather than answering about
+                    # the paper. A caller deciding "is this paper worth another attempt"
+                    # cannot tell from the status alone -- see host_gate.
+                    "host_blocked": isinstance(exc, HostBlockedError),
+                    "host": getattr(exc, "host", "") or host_gate.host_key(attempted_url),
                 })
                 manifest.stats["download_attempts"] = attempts
                 self.manifest_store.save(manifest)
@@ -560,6 +606,55 @@ class DownloadOrchestrator:
         error = DownloadError(summary_error)
         setattr(error, "download_attempts", attempts)
         raise error
+
+    def _retry_via_landing_page(
+        self,
+        exc: NotAPDFError,
+        candidate: SourceCandidate,
+        output_pdf_path: str,
+        *,
+        index: int,
+        total: int,
+        paper: PaperRecord,
+    ) -> tuple[DownloadResult, str]:
+        """The URL served a web page. Look for the PDF link on it and try that, once.
+
+        Most gold-OA DOIs resolve to an article page rather than a file, so without this a
+        freely available paper is reported as undownloadable. One hop only, and only to a
+        link the page itself offers: no crawling, no guessing at URL patterns.
+
+        Re-raises the original NotAPDFError when the page offers nothing, so the caller
+        still sees the real reason and moves on to the next candidate.
+        """
+        if not self.config.download.landing_page_fallback:
+            raise exc
+
+        landing_url = exc.final_url or candidate.pdf_url
+        pdf_url = extract_pdf_url(exc.body, landing_url)
+        if not pdf_url or pdf_url == candidate.pdf_url:
+            # Before concluding "this page offers no PDF", check whether it is a page at
+            # all. Cloudflare and Incapsula serve their interstitials with a 200 and no
+            # download link, which is indistinguishable from a paywalled article stub
+            # unless you look at the boilerplate.
+            if host_gate.note_challenge_page(landing_url, exc.body):
+                raise HostBlockedError(
+                    f"{host_gate.host_key(landing_url)} served a bot challenge instead of "
+                    f"the article page: {landing_url}",
+                    host=host_gate.host_key(landing_url),
+                ) from exc
+            raise exc
+
+        self._log(
+            index, total, self._ref(paper),
+            f"{candidate.source_name} served a landing page | following its PDF link | {pdf_url}",
+        )
+        result = self.downloader.download(
+            pdf_url,
+            output_pdf_path,
+            skip_if_valid=self.config.resume.verify_existing_files,
+            referer=landing_url,
+        )
+        return result, pdf_url
 
     def _is_stage_completed(self, manifest: PipelineManifest, stage: PipelineStage) -> bool:
         if not self.config.resume.enabled or not self.config.resume.skip_completed_stages:

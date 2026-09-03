@@ -54,7 +54,60 @@ def download(
     resolved_ids = _resolve_ids(ids)
     resolved_config = _resolve_download_config(config, config_path)
     orchestrator = DownloadOrchestrator(resolved_config)
-    return orchestrator.process_inputs(resolved_ids)
+    try:
+        return orchestrator.process_inputs(resolved_ids)
+    finally:
+        # The downloader keeps one HTTP session open across a call now, so a one-shot
+        # `download()` has something to release. `open_downloader` is the door for callers
+        # walking a list; this one builds and discards an orchestrator per call.
+        orchestrator.close()
+
+
+class DownloaderHandle:
+    """A downloader kept open across many papers.
+
+    ``download()`` builds a fresh orchestrator per call: eight provider HTTP sessions, a
+    Semantic Scholar client, and a re-read of config.json. That is wasted work when a
+    caller is walking a list of papers one at a time -- which it must, if it wants to
+    record progress after each one rather than only at the end of a batch.
+
+    Not thread-safe, on purpose: the providers hold ``requests.Session`` objects, which are
+    not safe to share. A caller wanting parallelism should open one handle per thread,
+    which costs nothing beyond the sessions each thread was going to need anyway.
+    """
+
+    def __init__(self, config: PipelineConfig) -> None:
+        self._orchestrator = DownloadOrchestrator(config)
+
+    def download_one(self, identifier: str) -> DownloadPipelineResult:
+        """Download one paper. Returns a result even on failure; never raises for a
+        per-paper problem -- check ``.downloaded`` and ``.failure_code``."""
+        results = self._orchestrator.process_inputs([identifier])
+        return results[0]
+
+    def __enter__(self) -> "DownloaderHandle":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Release the HTTP session held open across downloads."""
+        self._orchestrator.close()
+
+
+def open_downloader(
+    *,
+    config: PipelineConfig | None = None,
+    config_path: str | Path | None = None,
+) -> DownloaderHandle:
+    """Open a reusable downloader; see DownloaderHandle.
+
+        with paper_data.open_downloader(config=cfg) as dl:
+            for paper_id in ids:
+                result = dl.download_one(paper_id)
+    """
+    return DownloaderHandle(_resolve_download_config(config, config_path))
 
 
 def _resolve_ids(ids: str | list[str] | Path) -> list[str]:
@@ -166,6 +219,27 @@ def preview_queries(
     resolved_config = _resolve_metadata_config(config, config_path, None, search_queries_path)
     search_queries = load_search_queries(resolved_config.search_queries_path)
     return preview_all_queries(search_queries, resolved_config)
+
+
+def sample_queries(
+    *,
+    config: MetadataConfig | None = None,
+    config_path: str | Path | None = None,
+    search_queries_path: str | Path | None = None,
+    n: int = 20,
+) -> dict[str, list[dict]]:
+    """
+    Fetch the first n papers for each query without full pagination.
+    One API request per query — fast sanity check before a full run.
+
+    Returns {query_id: [paper_dict, ...]} where each dict has:
+    paperId, title, abstract, year, citationCount, authors, venue.
+    """
+    from paper_metadata.acquisition.semantic_scholar import load_search_queries, sample_all_queries
+
+    resolved_config = _resolve_metadata_config(config, config_path, None, search_queries_path)
+    search_queries = load_search_queries(resolved_config.search_queries_path)
+    return sample_all_queries(search_queries, resolved_config, n=n)
 
 
 def list_runs(base_dir: str | Path) -> list[RunSummary]:
