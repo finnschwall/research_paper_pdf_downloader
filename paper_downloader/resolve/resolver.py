@@ -30,6 +30,12 @@ class SourceCandidate:
     is_direct_pdf: bool = True
     title_match_score: float | None = None
     reason: str | None = None
+    #: Try this only after every other candidate has failed, whatever it scores. Set by
+    #: providers whose candidate is a worse *fetch* than a lower-scoring alternative --
+    #: `publisher_landing` names the version of record, so it wins on every other term in
+    #: `SourceResolver._sort_key`, but a free mirror costs the publisher nothing and is not
+    #: behind a bot wall. Also keeps such a candidate from ending the provider search.
+    fallback_only: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -270,6 +276,10 @@ class SourceResolver:
             return False
         threshold = self.config.stop_confidence_threshold
         for candidate in candidates:
+            if candidate.fallback_only:
+                # A last-resort candidate is never a reason to stop looking -- finding a
+                # free copy is the whole point of the providers still to come.
+                continue
             if not candidate.is_direct_pdf or candidate.confidence < threshold:
                 continue
             if not self._is_trusted_domain(candidate.domain):
@@ -279,8 +289,9 @@ class SourceResolver:
             return True
         return False
 
-    def _sort_key(self, candidate: SourceCandidate) -> tuple[int, int, int, float]:
+    def _sort_key(self, candidate: SourceCandidate) -> tuple[int, int, int, int, float]:
         return (
+            0 if candidate.fallback_only else 1,
             1 if candidate.version_type == "publisher" else 0,
             1 if candidate.is_direct_pdf else 0,
             1 if candidate.host_type == "publisher" else 0,

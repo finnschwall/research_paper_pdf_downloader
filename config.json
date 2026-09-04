@@ -19,7 +19,8 @@
       "core",
       "zenodo",
       "doaj",
-      "broad_search"
+      "broad_search",
+      "publisher_landing"
     ],
     "trusted_domains": [
       "arxiv.org",

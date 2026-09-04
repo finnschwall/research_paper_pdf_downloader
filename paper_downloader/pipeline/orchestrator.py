@@ -38,6 +38,7 @@ from paper_downloader.sources.cvf import CVFSourceProvider
 from paper_downloader.sources.doaj import DOAJSourceProvider
 from paper_downloader.sources.europepmc import EuropePMCSourceProvider
 from paper_downloader.sources.openalex import OpenAlexSourceProvider
+from paper_downloader.sources.publisher import PublisherLandingSourceProvider
 from paper_downloader.sources.unpaywall import UnpaywallSourceProvider
 from paper_downloader.sources.zenodo import ZenodoSourceProvider
 from paper_downloader.state.manifest_store import ManifestStore
@@ -147,6 +148,9 @@ class DownloadOrchestrator:
             "zenodo": lambda: ZenodoSourceProvider(config.download, config.resolution),
             "doaj": lambda: DOAJSourceProvider(config.download, config.resolution),
             "broad_search": lambda: BroadSearchSourceProvider(config.download, config.resolution),
+            "publisher_landing": lambda: PublisherLandingSourceProvider(
+                config.apis, config.download, config.resolution
+            ),
         }
 
         logger = logging.getLogger("paper_downloader")
@@ -412,6 +416,23 @@ class DownloadOrchestrator:
             msg = f"{msg} | " + " | ".join(parts)
         self._log(index, total, self._ref(paper), msg)
 
+    def _can_reuse_resolution(self, manifest: PipelineManifest) -> bool:
+        """May this paper skip resolution and reuse the candidate list on its manifest?
+
+        Only while that list has not already been tried and lost. Resume exists for the run
+        that was interrupted before downloading; once the download stage has failed, every
+        candidate in the list is a proven dead URL and replaying it fails the same way. It
+        is also how a paper stays permanently unavailable after a new source provider is
+        added, because the provider chain never runs for it again. Retrying a failed paper
+        has to mean resolving it afresh.
+        """
+        if not self._is_stage_completed(manifest, PipelineStage.RESOLVE_SOURCE):
+            return False
+        if not manifest.selected_source:
+            return False
+        download = manifest.get_stage_state(PipelineStage.DOWNLOAD_PDF)
+        return download.status != StageStatus.FAILED
+
     def _handle_resolution_stage(
         self,
         manifest: PipelineManifest,
@@ -420,7 +441,7 @@ class DownloadOrchestrator:
         index: int,
         total: int,
     ) -> ResolutionResult:
-        if self._is_stage_completed(manifest, PipelineStage.RESOLVE_SOURCE) and manifest.selected_source:
+        if self._can_reuse_resolution(manifest):
             resolution_stats = manifest.stats.get("resolution") or {}
             selected = manifest.selected_source
 

@@ -46,6 +46,9 @@ class ResolutionConfig:
             "zenodo",
             "doaj",
             "broad_search",
+            # Last on purpose: it asks the publisher, which every provider above exists to
+            # avoid. See sources/publisher.py.
+            "publisher_landing",
         ]
     )
 

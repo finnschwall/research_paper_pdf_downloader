@@ -21,7 +21,7 @@ _BLOCKED_URL_PATTERNS: tuple[str, ...] = (
         "qa.",
     )
 
-def _is_staging_url(url: str) -> bool:
+def is_staging_url(url: str) -> bool:
     lowered = url.lower()
     return any(pattern in lowered for pattern in _BLOCKED_URL_PATTERNS)
 
@@ -216,7 +216,7 @@ class CrossrefSourceProvider:
             if not content_is_pdf:
                 continue
 
-            if _is_staging_url(url):    
+            if is_staging_url(url):    
                 continue
 
             if url in seen_urls:
