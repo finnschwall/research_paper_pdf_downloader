@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote
+
 
 import requests
 
 from paper_downloader.core import host_gate
 
 from paper_downloader.config.models import ApiConfig, DownloadConfig, ResolutionConfig
+from paper_downloader.metadata import works
 from paper_downloader.models.paper import PaperRecord
 from paper_downloader.resolve.resolver import SourceCandidate, validate_title_match
 
@@ -176,13 +177,18 @@ class CrossrefSourceProvider:
         return payload if isinstance(payload, dict) else None
 
     def _fetch_by_doi(self, doi: str) -> dict[str, Any] | None:
-        encoded = quote(doi.strip(), safe="")
-        payload = self._request_json(f"{self.base_url}/works/{encoded}")
-        if not payload:
-            return None
-        # Crossref wraps the work in {"status": "ok", "message": {...}}
-        message = payload.get("message")
-        return message if isinstance(message, dict) else None
+        """The work record, through the shared cache. Three things in this library want it."""
+        lookup = works.crossref_work(
+            doi,
+            session=self._session,
+            timeout=self._timeout(),
+            verify=self.download_config.verify_ssl,
+            base_url=self.base_url,
+        )
+        if lookup.error:
+            self.last_failed = True
+            self.last_reason = lookup.error
+        return lookup.work
     
     
 

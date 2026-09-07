@@ -27,6 +27,9 @@ def _apply_env_overrides(payload: dict[str, Any]) -> dict[str, Any]:
         "UNPAYWALL_EMAIL":          "unpaywall_email",
         "CORE_API_KEY":             "core_api_key",
         "CROSSREF_EMAIL":           "crossref_email",
+        "WILEY_TDM_TOKEN":          "wiley_tdm_token",
+        "ELSEVIER_API_KEY":         "elsevier_api_key",
+        "ELSEVIER_INST_TOKEN":      "elsevier_inst_token",
     }
 
     for env_var, config_key in env_map.items():

@@ -32,12 +32,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import requests
 
 from paper_downloader.config.models import ApiConfig, DownloadConfig, ResolutionConfig
 from paper_downloader.core import host_gate
+from paper_downloader.metadata import works
 from paper_downloader.models.paper import PaperRecord
 from paper_downloader.resolve.resolver import SourceCandidate
 from paper_downloader.sources.crossref import is_staging_url
@@ -129,28 +130,13 @@ class PublisherLandingSourceProvider:
         record is unavailable either way, and raising would only cost the provider chain
         its remaining candidates.
         """
-        encoded = quote(doi.strip(), safe="")
-        try:
-            response = self._session.get(
-                f"{self.base_url}/works/{encoded}",
-                timeout=self._timeout(),
-                allow_redirects=True,
-                verify=self.download_config.verify_ssl,
-            )
-        except requests.RequestException:
-            return None
-
-        if response.status_code >= 400:
-            return None
-
-        try:
-            payload = response.json()
-        except ValueError:
-            return None
-        if not isinstance(payload, dict):
-            return None
-
-        message = payload.get("message")
+        message = works.crossref_work(
+            doi,
+            session=self._session,
+            timeout=self._timeout(),
+            verify=self.download_config.verify_ssl,
+            base_url=self.base_url,
+        ).work
         if not isinstance(message, dict):
             return None
 

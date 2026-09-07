@@ -47,22 +47,34 @@ class NotAPDFError(PDFValidationError):
 
 
 class HostBlockedError(DownloadError):
-    """The host is refusing this server, not answering about this paper.
+    """The host turned this client away without answering about the paper.
 
-    Raised when a response looks like an edge-network denial or a bot challenge rather than
-    a document -- see paper_downloader.core.host_gate. Kept apart from HTTPStatusError
-    because the two mean opposite things to a caller deciding whether to try again: a 403
-    on an article is a fact about the article, whereas this is a fact about us, and the
-    paper is worth another attempt once the block ages out.
+    Kept apart from HTTPStatusError because the two mean opposite things to a caller
+    deciding whether to try again: a 403 on an article is a fact about the article, whereas
+    this is a fact about us.
+
+    Three different facts, and the flags say which -- because they have three different
+    remedies and a caller that flattens them will retry the hopeless and give up on the
+    recoverable:
+
+    * ``denied``: the host is on the configured deny list and was never asked. Configuration.
+    * ``challenge``: a bot wall answered. No address, delay or User-Agent changes this; the
+      route is a publisher API, a cached copy elsewhere, or a person with a browser.
+    * neither: this address was refused, in a rate- or IP-shaped way. Worth another attempt
+      once the cool-off passes, or from a different network.
     """
 
-    def __init__(self, message: str, *, host: str = "", denied: bool = False) -> None:
+    def __init__(
+        self, message: str, *, host: str = "", denied: bool = False, challenge: bool = False,
+    ) -> None:
         super().__init__(message)
         self.host = host
         #: True when the host was never asked because it is on the configured deny list,
         #: as opposed to having actually refused a request. Callers storing the detail
         #: must not describe the first as the second.
         self.denied = denied
+        #: True when a bot-management product answered instead of the host. See host_gate.
+        self.challenge = challenge
 
 
 class HTTPStatusError(DownloadError):

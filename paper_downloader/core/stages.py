@@ -7,6 +7,9 @@ class PipelineStage(str, Enum):
     PARSE_INPUT = "parse_input"
     FETCH_METADATA = "fetch_metadata"
     RECOVER_IDENTIFIERS = "recover_identifiers"
+    #: Decide what kind of record this is before spending anything on it. See
+    #: paper_downloader.metadata.record_class.
+    CLASSIFY_RECORD = "classify_record"
     RESOLVE_SOURCE = "resolve_source"
     DOWNLOAD_PDF = "download_pdf"
     EXTRACT_MARKDOWN = "extract_markdown"
@@ -17,6 +20,7 @@ PIPELINE_STAGE_ORDER: tuple[PipelineStage, ...] = (
     PipelineStage.PARSE_INPUT,
     PipelineStage.FETCH_METADATA,
     PipelineStage.RECOVER_IDENTIFIERS,
+    PipelineStage.CLASSIFY_RECORD,
     PipelineStage.RESOLVE_SOURCE,
     PipelineStage.DOWNLOAD_PDF,
     PipelineStage.EXTRACT_MARKDOWN,

@@ -9,8 +9,9 @@ from pathlib import Path
 
 import requests
 
-from paper_downloader.config.models import DownloadConfig
+from paper_downloader.config.models import ApiConfig, DownloadConfig
 from paper_downloader.core import host_gate
+from paper_downloader.core.credentials import CredentialTable, build_credentials
 from paper_downloader.core.exceptions import (
     DownloadError,
     HostBlockedError,
@@ -18,6 +19,7 @@ from paper_downloader.core.exceptions import (
     NotAPDFError,
     PDFValidationError,
 )
+from paper_downloader.download.entitlement import not_the_full_article
 from paper_downloader.storage.writers import ensure_parent_dir
 
 logger = logging.getLogger("paper_downloader")
@@ -77,10 +79,20 @@ class PDFDownloader:
     thread-safe, for the same reason `requests.Session` is not: give each thread its own.
     """
 
-    def __init__(self, config: DownloadConfig, *, session: requests.Session | None = None) -> None:
+    def __init__(
+        self,
+        config: DownloadConfig,
+        *,
+        api_config: ApiConfig | None = None,
+        session: requests.Session | None = None,
+    ) -> None:
         self.config = config
         self._session = session if session is not None else host_gate.GatedSession()
         self._owns_session = session is None
+        # Host -> credential. Attached at request time and never at URL-building time, so
+        # nothing secret reaches a manifest, a stats file or a stored source URL. See
+        # paper_downloader.core.credentials.
+        self.credentials: CredentialTable = build_credentials(api_config)
 
     def close(self) -> None:
         if self._owns_session:
@@ -182,6 +194,17 @@ class PDFDownloader:
 
                 content_type = response.headers.get("Content-Type")
                 final_url = str(response.url)
+
+                # A publisher API can answer with a valid PDF that is only the article's
+                # first page. Every later check passes, so the one moment this is catchable
+                # is here, while the entitlement header is still in hand.
+                preview = not_the_full_article(host_gate.host_key(final_url), response.headers)
+                if preview:
+                    raise HTTPStatusError(
+                        f"{host_gate.host_key(final_url)} sent a preview, not the article "
+                        f"({preview}) for url: {url}",
+                        status_code=403,
+                    )
                 total_bytes = 0
                 first_bytes = b""
                 sha256 = hashlib.sha256()
@@ -213,11 +236,15 @@ class PDFDownloader:
                 # nothing about why.
                 if total_bytes == 0 and response.status_code != 200:
                     tmp_path.unlink(missing_ok=True)
-                    if host_gate.note_response(url, response.status_code, b""):
+                    kind = host_gate.note_response(
+                        url, response.status_code, b"", headers=response.headers,
+                    )
+                    if kind:
                         raise HostBlockedError(
                             f"{host_gate.host_key(url)} answered HTTP "
                             f"{response.status_code} with an empty body for: {url}",
                             host=host_gate.host_key(url),
+                            challenge=(kind == "challenge"),
                         )
         except (DownloadError, PDFValidationError):
             raise
@@ -251,10 +278,17 @@ class PDFDownloader:
         )
 
     def _get(self, url: str, *, referer: str | None) -> requests.Response:
+        headers = self._request_headers(url, referer=referer)
+        params: dict[str, str] | None = None
+        credential = self.credentials.for_url(url)
+        if credential is not None:
+            headers.update(credential.headers)
+            params = dict(credential.params) or None
         try:
             return self._session.get(
                 url,
-                headers=self._request_headers(url, referer=referer),
+                headers=headers,
+                params=params,
                 stream=True,
                 timeout=(self.config.connect_timeout_seconds, self.config.read_timeout_seconds),
                 allow_redirects=True,
@@ -281,7 +315,14 @@ class PDFDownloader:
         if response.status_code == 429:
             host_gate.note_retry_after(url, _retry_after_seconds(response))
 
-        if host_gate.note_response(url, response.status_code, peek):
+        kind = host_gate.note_response(url, response.status_code, peek, headers=response.headers)
+        if kind == "challenge":
+            raise HostBlockedError(
+                f"{host_gate.host_key(url)} bot-challenged this client with HTTP "
+                f"{response.status_code} for: {url}",
+                host=host_gate.host_key(url), challenge=True,
+            )
+        if kind == "refusal":
             raise HostBlockedError(
                 f"{host_gate.host_key(url)} refused this server with HTTP "
                 f"{response.status_code} for: {url}",
@@ -389,16 +430,24 @@ class PDFDownloader:
         size_bytes: int,
         final_url: str = "",
     ) -> None:
-        if size_bytes < self.config.min_pdf_bytes:
-            raise PDFValidationError(
-                f"Downloaded file is too small to be a valid PDF: {path}"
-            )
+        """Reject what is not the paper, saying *why* rather than "too small".
 
+        The content check runs before the size check, and that order is the whole point.
+        Imperva's interstitial is a 212-byte page whose only job is to load a JavaScript
+        challenge; when the size check ran first, it raised "too small to be a valid PDF" and
+        the page was never read -- so a bot wall was recorded as a broken file, and the
+        obvious-looking fix (raise the size limit) would have changed nothing.
+        """
         if not self._looks_like_pdf(first_bytes):
             raise NotAPDFError(
                 f"Downloaded file does not look like a PDF: {path}",
                 final_url=final_url,
                 body=self._read_page_text(path),
+            )
+
+        if size_bytes < self.config.min_pdf_bytes:
+            raise PDFValidationError(
+                f"Downloaded file is too small to be a valid PDF: {path}"
             )
 
         if content_type:

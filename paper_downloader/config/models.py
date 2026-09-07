@@ -11,11 +11,31 @@ class RuntimeConfig:
 
 @dataclass(slots=True)
 class ApiConfig:
+    """Keys and contact addresses the providers need.
+
+    None or empty switches the matching provider off rather than making it fail: a
+    deployment without a Wiley token simply never asks Wiley. See
+    `paper_downloader.core.credentials` for how the three secret ones reach a request
+    without ever entering a URL.
+    """
     semantic_scholar_api_key: str | None = None
+    #: Raises OpenAlex's rate limit, and is *required* for the metered full-text cache
+    #: (`sources/openalex_content.py`) -- that endpoint answers 401 without one.
     openalex_api_key: str | None = None
+    #: Unpaywall returns nothing at all without a contact address.
     unpaywall_email: str | None = None
     core_api_key: str | None = None
+    #: Puts Crossref requests in its faster "polite pool".
     crossref_email: str | None = None
+    #: Wiley text-and-data-mining token (a UUID, from Wiley's TDM page after the
+    #: click-through licence). Authorisation is by institutional IP range as well, so the
+    #: same token works from a subscribing network and not from a home connection.
+    wiley_tdm_token: str | None = None
+    #: Elsevier Article Retrieval API key, self-registered at dev.elsevier.com.
+    elsevier_api_key: str | None = None
+    #: Optional Elsevier institutional token, which extends the key's entitlement to the
+    #: subscribing institution's holdings.
+    elsevier_inst_token: str | None = None
 
 
 @dataclass(slots=True)
@@ -45,7 +65,16 @@ class ResolutionConfig:
             "core",
             "zenodo",
             "doaj",
+            # Publisher text-and-data-mining APIs. Later than the free aggregators because
+            # a repository copy costs the publisher nothing, earlier than the last resorts
+            # because they are sanctioned routes that actually work where the website does
+            # not. Each is inert until its key is configured.
+            "wiley",
+            "elsevier",
             "broad_search",
+            # Metered: OpenAlex charges about a cent per cached PDF, so it is asked only
+            # once every free route has been tried and failed. See sources/openalex_content.py.
+            "openalex_content",
             # Last on purpose: it asks the publisher, which every provider above exists to
             # avoid. See sources/publisher.py.
             "publisher_landing",
@@ -61,6 +90,8 @@ class ResolutionConfig:
             "openaccess.thecvf.com",
             "api.openalex.org",
             "content.openalex.org",
+            "api.wiley.com",
+            "api.elsevier.com",
             "doi.org",
             "dl.acm.org",
             "ieeexplore.ieee.org",

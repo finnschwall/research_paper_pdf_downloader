@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote
+
 
 import requests
 
 from paper_downloader.core import host_gate
 
 from paper_downloader.config.models import ApiConfig, DownloadConfig, ResolutionConfig
+from paper_downloader.metadata import works
 from paper_downloader.metadata.pmc import (
     europepmc_landing_url,
     europepmc_render_url,
@@ -185,11 +186,19 @@ class OpenAlexSourceProvider:
         return payload if isinstance(payload, dict) else None
 
     def _fetch_work_by_doi(self, doi: str) -> dict[str, Any] | None:
-        normalized = doi.strip().lower()
-        doi_url = f"https://doi.org/{normalized}"
-        encoded = quote(doi_url, safe=":/")
-        url = f"{self.base_url}/works/{encoded}"
-        return self._request_json(url)
+        """The work record, through the shared cache -- the classifier already fetched it."""
+        lookup = works.openalex_work(
+            doi,
+            session=self._session,
+            timeout=self._timeout(),
+            verify=self.download_config.verify_ssl,
+            api_key=self.api_config.openalex_api_key,
+            base_url=self.base_url,
+        )
+        if lookup.error:
+            self.last_failed = True
+            self.last_reason = lookup.error
+        return lookup.work
 
     def _search_works_by_title(self, title: str) -> list[dict[str, Any]]:
         payload = self._request_json(

@@ -10,6 +10,14 @@ is how a systematic review ends up citing the wrong paper.
 Withdrawn preprints are recognised (``<arxiv:comment>``) and never offered: a review should
 not silently include a paper its authors pulled. The reason is reported so the caller can
 record ``withdrawn`` rather than "no copy found".
+
+The exact-id path is the exception, and deliberately so. Given an arXiv id this provider
+builds the PDF URL without asking the API at all, which is what makes it the fastest route in
+the library -- but it therefore never sees the withdrawal note. arXiv answers a withdrawn
+paper's PDF URL with a 404, and a bare 404 reads as a broken link. So the check is deferred
+rather than dropped: ``withdrawal_note`` asks the API for exactly one id, and the download
+stage calls it only after an arXiv candidate has actually 404'd. One extra request for the
+rare withdrawn paper, none for the other thousands.
 """
 from __future__ import annotations
 
@@ -207,6 +215,36 @@ class ArxivSourceProvider:
             self.last_reason = f"arxiv api http {response.status_code}"
             return None
         return parse_atom_feed(response.text)
+
+    def withdrawal_note(self, arxiv_id: str) -> str | None:
+        """arXiv's own note on why this id was withdrawn, or None if it was not.
+
+        One API call, made only when the PDF URL for a known id has already answered 404 --
+        which for arXiv means the paper was pulled, since the id itself was valid enough to
+        reach the endpoint. Returns None on any doubt, including a failed request: reporting
+        a paper as withdrawn is a decision a review acts on, so it needs the note itself.
+        """
+        cleaned = normalize_arxiv_id(arxiv_id) or (arxiv_id or "").strip()
+        if not cleaned:
+            return None
+        try:
+            response = self._get_session().get(
+                _API_URL,
+                params={"id_list": cleaned, "max_results": "1"},
+                timeout=(
+                    self.download_config.connect_timeout_seconds,
+                    self.download_config.read_timeout_seconds,
+                ),
+                verify=self.download_config.verify_ssl,
+            )
+        except requests.RequestException:
+            return None
+        if response.status_code >= 400:
+            return None
+        for hit in parse_atom_feed(response.text):
+            if hit.withdrawn:
+                return hit.comment or "withdrawn"
+        return None
 
     def _get_session(self) -> requests.Session:
         if self._session is None:

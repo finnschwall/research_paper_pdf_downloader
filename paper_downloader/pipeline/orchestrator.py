@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields as dc_fields
+from datetime import date
 import logging
 from pathlib import Path
 from typing import Any, Callable
@@ -19,6 +20,8 @@ from paper_downloader.core.stages import PipelineStage
 from paper_downloader.download.downloader import PDFDownloader, DownloadResult
 from paper_downloader.download.landing_page import extract_pdf_url
 from paper_downloader.inputs.parser import parse_inputs
+from paper_downloader.metadata import record_class as rc
+from paper_downloader.metadata import works
 from paper_downloader.metadata.pmc import (
     europepmc_render_url,
     is_pmc_interstitial,
@@ -41,9 +44,12 @@ from paper_downloader.sources.core import CORESourceProvider
 from paper_downloader.sources.crossref import CrossrefSourceProvider
 from paper_downloader.sources.cvf import CVFSourceProvider
 from paper_downloader.sources.doaj import DOAJSourceProvider
+from paper_downloader.sources.elsevier import ElsevierSourceProvider
 from paper_downloader.sources.europepmc import EuropePMCSourceProvider
 from paper_downloader.sources.openalex import OpenAlexSourceProvider
+from paper_downloader.sources.openalex_content import OpenAlexContentSourceProvider
 from paper_downloader.sources.publisher import PublisherLandingSourceProvider
+from paper_downloader.sources.wiley import WileySourceProvider
 from paper_downloader.sources.unpaywall import UnpaywallSourceProvider
 from paper_downloader.sources.zenodo import ZenodoSourceProvider
 from paper_downloader.state.manifest_store import ManifestStore
@@ -81,8 +87,19 @@ class DownloadPipelineResult:
     #: but this client could not fetch it", which a caller must keep apart from "not free".
     oa_asserted_by: list[str] = field(default_factory=list)
     #: Why the paper has no PDF, in one word a caller can branch on. One of
-    #: FAILURE_REASONS, or None on success.
+    #: FAILURE_REASONS, or None on success and on every `skipped_*` status.
     failure_reason: str | None = None
+    #: What kind of record this is, when it is not an ordinary paper: one of
+    #: `metadata.record_class.RECORD_CLASSES`, else None. A *terminal* class means there was
+    #: never anything to fetch, which is a different fact from a download that failed -- see
+    #: `status`, which is then `skipped_<class>`.
+    record_class: str | None = None
+    #: The signal that decided `record_class`, in a sentence.
+    record_class_reason: str | None = None
+    #: The article has been retracted. Never stops a fetch; it is a flag for whoever screens
+    #: the review, because a retracted paper still has a PDF and still has to be excluded on
+    #: purpose rather than by accident.
+    retracted: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,20 +122,81 @@ class DownloadPipelineResult:
             "error": self.error,
             "oa_asserted_by": list(self.oa_asserted_by),
             "failure_reason": self.failure_reason,
+            "record_class": self.record_class,
+            "record_class_reason": self.record_class_reason,
+            "retracted": self.retracted,
         }
 
 
 #: The vocabulary of `DownloadPipelineResult.failure_reason`, most to least decisive when
 #: several attempts say different things (see `_failure_reason`).
+#:
+#: The order is the whole design. A host that never answered about the paper outranks
+#: everything, because nothing was learned; a transient error outranks a permanent-looking
+#: one, because a re-run might succeed; a page that needs a browser outranks "not free",
+#: because a person could still get it. Read top to bottom, this is also the order of how
+#: little the result tells you about the paper itself.
 FAILURE_REASONS = (
-    "host_refused_client",   # a host turned this client away; nothing learned about the paper
-    "host_denied",           # a host on the configured deny list was never asked
-    "transient",             # 5xx, 429, network error, metadata lookup -- try again later
-    "page_without_link",     # reached an article page whose PDF needs a browser
-    "withdrawn",             # the arXiv copy was withdrawn
-    "not_free",              # 401/403 on the article itself, or no candidate anywhere
-    "dead_link",             # every URL on record answers 404 or the like
+    # A bot wall stopped a non-browser client. Says nothing about the paper, the address or
+    # the rate -- and no address or delay changes it. The route is a publisher API, a cached
+    # copy elsewhere, or a person with a browser.
+    "client_challenged",
+    # An edge denial shaped like a rate or IP limit: 429, Retry-After, a refusal that clears
+    # from a different network. Worth another attempt later.
+    "host_refused_client",
+    # A host on the configured deny list was never asked at all.
+    "host_denied",
+    # 5xx, network error, metadata lookup failed.
+    "transient",
+    # Reached a real article page with no followable PDF link: a JavaScript download button,
+    # a repository landing page with nothing deposited.
+    "page_without_link",
+    # The arXiv copy was withdrawn by its authors or by arXiv.
+    "withdrawn",
+    # The record is days or weeks old, the publisher serves HTML and no PDF to anyone yet.
+    # The only reason here that time alone fixes.
+    "not_yet_available",
+    # Every source says closed, or 401/403 on the article itself with no free copy anywhere.
+    "not_free",
+    # Every URL on record answers 404 and the record is not withdrawn.
+    "dead_link",
 )
+
+#: How recently published an article has to be for "the PDF is not up yet" to be a more
+#: likely explanation than "the publisher will not give it to us". Sixty days is generous;
+#: the cases seen were within three weeks of publication.
+_NOT_YET_AVAILABLE_DAYS = 60
+
+
+@dataclass(slots=True)
+class _Hop:
+    """Where one download attempt actually went, as opposed to where it was aimed.
+
+    A candidate URL is only the start. The attempt may follow a link off a landing page, or
+    be rewritten to Europe PMC, and then redirect somewhere else again. Recording only the
+    candidate URL -- which is what the manifest used to hold -- makes a failure that followed
+    two hops indistinguishable from one that never left the first.
+    """
+    candidate_url: str
+    #: The URL of the request that actually decided the attempt.
+    attempted_url: str = ""
+    #: The page whose link we followed to get to `attempted_url`, when there was one.
+    followed_from: str | None = None
+    #: Where that request ended after redirects.
+    final_url: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.attempted_url:
+            self.attempted_url = self.candidate_url
+
+    def trail(self) -> dict[str, Any]:
+        """The fields to merge into a manifest attempt record. Omits what adds nothing."""
+        trail: dict[str, Any] = {"candidate_url": self.candidate_url}
+        if self.followed_from:
+            trail["followed_from"] = self.followed_from
+        if self.final_url and self.final_url != self.attempted_url:
+            trail["final_url"] = self.final_url
+        return trail
 
 
 class DownloadOrchestrator:
@@ -139,8 +217,19 @@ class DownloadOrchestrator:
         self.metadata_client = metadata_client or SemanticScholarClient(
             config.apis, config.download
         )
-        self.downloader = downloader or PDFDownloader(config.download)
+        self.downloader = downloader or PDFDownloader(config.download, api_config=config.apis)
         self.logger = logging.getLogger("paper_downloader")
+        # One session for the classify stage's two metadata lookups. Its answers go into the
+        # shared cache, so the crossref, openalex and publisher_landing providers reuse them
+        # instead of asking again -- which is what makes classification cost nothing.
+        self._metadata_session = host_gate.GatedSession()
+        self._metadata_session.headers.update({
+            "Accept": "application/json",
+            "User-Agent": (
+                f"{config.download.user_agent} (mailto:{config.apis.crossref_email})"
+                if config.apis.crossref_email else config.download.user_agent
+            ),
+        })
 
         # Both are process-wide facts, so they live in host_gate rather than on this
         # object: every downloader and every provider session in the process must agree
@@ -153,10 +242,12 @@ class DownloadOrchestrator:
         self.resolver = resolver
 
     def close(self) -> None:
-        """Release the downloader's HTTP session. Safe to call more than once."""
+        """Release the HTTP sessions this orchestrator owns. Safe to call more than once."""
         closer = getattr(self.downloader, "close", None)
         if callable(closer):
             closer()
+        if self._metadata_session is not None:
+            self._metadata_session.close()
 
     @staticmethod
     def _build_resolver(config: PipelineConfig) -> SourceResolver:
@@ -180,6 +271,11 @@ class DownloadOrchestrator:
             "core": lambda: CORESourceProvider(config.apis, config.download, config.resolution),
             "zenodo": lambda: ZenodoSourceProvider(config.download, config.resolution),
             "doaj": lambda: DOAJSourceProvider(config.download, config.resolution),
+            "wiley": lambda: WileySourceProvider(config.apis, config.download, config.resolution),
+            "elsevier": lambda: ElsevierSourceProvider(config.apis, config.download, config.resolution),
+            "openalex_content": lambda: OpenAlexContentSourceProvider(
+                config.apis, config.download, config.resolution
+            ),
             "broad_search": lambda: BroadSearchSourceProvider(config.download, config.resolution),
             "publisher_landing": lambda: PublisherLandingSourceProvider(
                 config.apis, config.download, config.resolution
@@ -265,6 +361,10 @@ class DownloadOrchestrator:
             self._handle_metadata_stage(manifest, metadata_fetched, index=index, total=total, paper=paper)
             self._handle_identifier_stage(manifest, working_paper, index=index, total=total)
 
+            self._handle_classify_stage(manifest, working_paper, index=index, total=total)
+            if working_paper.record_class in rc.TERMINAL_CLASSES:
+                return self._skipped_result(manifest, paper, working_paper, index=index, total=total)
+
             resolution = self._handle_resolution_stage(manifest, working_paper, index=index, total=total)
             download_result = self._handle_download_stage(
                 manifest, resolution, index=index, total=total, paper=paper,
@@ -302,6 +402,9 @@ class DownloadOrchestrator:
                     (manifest.stats.get("resolution") or {}).get("provider_attempts") or []
                 ),
                 download_attempts=list(manifest.stats.get("download_attempts") or []),
+                record_class=working_paper.record_class,
+                record_class_reason=working_paper.record_class_reason,
+                retracted=working_paper.retracted,
             )
 
         except Exception as exc:
@@ -339,7 +442,13 @@ class DownloadOrchestrator:
                 )
 
             oa_asserted_by = self._oa_asserted_by(manifest)
-            failure_reason = self._failure_reason(failure_code, download_attempts, provider_attempts)
+            failure_reason = self._failure_reason(
+                failure_code, download_attempts, provider_attempts, paper=working_paper,
+            )
+            if failure_reason == "withdrawn" and not working_paper.record_class:
+                # arXiv answers a withdrawn paper's PDF URL with a plain 404, which reads as
+                # a broken link. Ask arXiv once, now that we know it is worth asking.
+                self._note_arxiv_withdrawal(working_paper, manifest)
             if manifest is not None:
                 manifest.stats["failure_reason"] = failure_reason
                 manifest.stats["oa_asserted_by"] = oa_asserted_by
@@ -367,6 +476,9 @@ class DownloadOrchestrator:
                 error=str(exc),
                 oa_asserted_by=oa_asserted_by,
                 failure_reason=failure_reason,
+                record_class=working_paper.record_class,
+                record_class_reason=working_paper.record_class_reason,
+                retracted=working_paper.retracted,
             )
 
     @staticmethod
@@ -384,17 +496,30 @@ class DownloadOrchestrator:
         return names
 
     @staticmethod
+    def _recently_published(paper: PaperRecord | None) -> bool:
+        """Was this article put online recently enough that its PDF may simply not be up yet?"""
+        raw = getattr(paper, "published_online", None)
+        if not raw:
+            return False
+        try:
+            published = date.fromisoformat(str(raw)[:10])
+        except ValueError:
+            return False
+        return (date.today() - published).days <= _NOT_YET_AVAILABLE_DAYS
+
+    @classmethod
     def _failure_reason(
+        cls,
         failure_code: str,
         attempts: list[dict[str, Any]],
         provider_attempts: list[dict[str, Any]],
+        *,
+        paper: PaperRecord | None = None,
     ) -> str:
         """One word for why there is no PDF, read off what actually happened.
 
-        Several attempts may disagree; the order in FAILURE_REASONS decides. A host turning
-        us away outranks everything because it says nothing about the paper; a transient
-        error outranks a permanent-looking one because a re-run might succeed; a page that
-        needs a browser outranks "not free" because a person could still get it.
+        Several attempts may disagree; the order in FAILURE_REASONS decides -- see the note
+        there for why that order is what it is.
         """
         if failure_code == "unresolved_no_legal_pdf":
             return "not_free"
@@ -403,15 +528,27 @@ class DownloadOrchestrator:
         if not attempts:
             return "transient"
 
+        recent = cls._recently_published(paper)
         found: set[str] = set()
         for a in attempts:
             status = a.get("http_status")
             if a.get("host_blocked"):
-                found.add("host_denied" if a.get("host_denied") else "host_refused_client")
+                if a.get("host_denied"):
+                    found.add("host_denied")
+                elif a.get("host_challenged"):
+                    found.add("client_challenged")
+                else:
+                    found.add("host_refused_client")
             elif status is not None and (status >= 500 or status == 429):
                 found.add("transient")
             elif a.get("not_a_pdf"):
-                found.add("page_without_link")
+                # A .pdf URL that answered with the article page, on an article published
+                # days ago, is a publisher that has not posted the file yet -- which time
+                # fixes on its own. The same thing on a year-old article is not.
+                if recent and ".pdf" in str(a.get("pdf_url") or "").lower():
+                    found.add("not_yet_available")
+                else:
+                    found.add("page_without_link")
             elif status == 404 and a.get("source_name") == "arxiv":
                 # arXiv answers 404 for exactly one thing: an id whose PDF was withdrawn.
                 found.add("withdrawn")
@@ -431,6 +568,160 @@ class DownloadOrchestrator:
             if reason in found:
                 return reason
         return "transient"
+
+    def _note_arxiv_withdrawal(self, paper: PaperRecord, manifest: PipelineManifest | None) -> None:
+        """Ask arXiv why an id 404'd, and record `withdrawn` when it says so.
+
+        Costs one API request, and only for a paper whose arXiv PDF has already answered 404.
+        Doing it up front would have cost one request per paper with an arXiv id, on a host
+        that asks for a three-second gap -- for a fact that matters to roughly one paper in a
+        thousand.
+        """
+        provider = self._provider_named("arxiv")
+        note = None
+        if provider is not None and paper.arxiv_id:
+            note = provider.withdrawal_note(paper.arxiv_id)
+        paper.record_class = rc.WITHDRAWN
+        paper.record_class_reason = (
+            f"arxiv: {note}" if note
+            else "arxiv answered 404 for a known id, which it does for withdrawn papers"
+        )
+        if manifest is not None:
+            manifest.paper_snapshot = paper.to_dict()
+            self.manifest_store.save(manifest)
+
+    def _provider_named(self, name: str):
+        """The resolver's provider with this name, or None if it is not in the chain."""
+        for provider in getattr(self.resolver, "providers", []):
+            if getattr(provider, "name", None) == name:
+                return provider
+        return None
+
+    def _handle_classify_stage(
+        self,
+        manifest: PipelineManifest,
+        paper: PaperRecord,
+        *,
+        index: int,
+        total: int,
+    ) -> None:
+        """Decide what kind of record this is, before spending anything on fetching it.
+
+        Two metadata lookups, both cached and both reused by the providers that come next, so
+        the stage is close to free. It answers a question a download failure never can: an
+        abstract, a poster and a paywalled article all end up with no PDF, and only this can
+        say that for three of them there was never a PDF to get.
+
+        Resumes from the manifest rather than asking again, because the answer is a property
+        of the record and records do not change between runs.
+        """
+        if self._is_stage_completed(manifest, PipelineStage.CLASSIFY_RECORD):
+            stored = manifest.get_stage_state(PipelineStage.CLASSIFY_RECORD).details or {}
+            paper.record_class = stored.get("record_class")
+            paper.record_class_reason = stored.get("reason") or None
+            paper.retracted = bool(stored.get("retracted"))
+            paper.published_online = stored.get("published_online")
+            return
+
+        if not paper.doi:
+            self.manifest_store.update_stage(
+                manifest, PipelineStage.CLASSIFY_RECORD, StageStatus.SKIPPED,
+                message="no doi to classify by",
+            )
+            return
+
+        timeout = (
+            self.config.download.connect_timeout_seconds,
+            self.config.download.read_timeout_seconds,
+        )
+        crossref = works.crossref_work(
+            paper.doi, session=self._metadata_session, timeout=timeout,
+            verify=self.config.download.verify_ssl,
+        ).work
+        openalex = works.openalex_work(
+            paper.doi, session=self._metadata_session, timeout=timeout,
+            verify=self.config.download.verify_ssl,
+            api_key=self.config.apis.openalex_api_key,
+        ).work
+
+        verdict = rc.classify(crossref=crossref, openalex=openalex, title=paper.title)
+        paper.record_class = verdict.record_class
+        paper.record_class_reason = verdict.reason or None
+        paper.retracted = verdict.retracted
+        paper.published_online = verdict.published_online
+
+        self.manifest_store.update_paper_snapshot(manifest, paper)
+        self.manifest_store.update_stage(
+            manifest, PipelineStage.CLASSIFY_RECORD, StageStatus.SUCCEEDED,
+            message=f"record class: {verdict.record_class or 'article'}",
+            details={
+                "record_class": verdict.record_class,
+                "reason": verdict.reason,
+                "retracted": verdict.retracted,
+                "published_online": verdict.published_online,
+            },
+        )
+        if verdict.record_class:
+            self._log(
+                index, total, self._ref(paper),
+                f"record class {verdict.record_class} ({verdict.reason})"
+                + ("; nothing to fetch" if verdict.terminal else ""),
+            )
+        if verdict.retracted:
+            self._log(
+                index, total, self._ref(paper),
+                "RETRACTED -- fetching anyway; flag this to whoever screens the review",
+                level="warning",
+            )
+
+    def _skipped_result(
+        self,
+        manifest: PipelineManifest,
+        paper: PaperRecord,
+        working_paper: PaperRecord,
+        *,
+        index: int,
+        total: int,
+    ) -> DownloadPipelineResult:
+        """The result for a record with nothing to fetch. No provider was asked, on purpose.
+
+        `failure_reason` is None and the status is `skipped_<class>`, so a caller can keep
+        these out of "could not retrieve" -- and out of a "retry the failures" run, where
+        they would burn the whole provider chain forever for a paper that does not exist as
+        a document.
+        """
+        self.manifest_store.update_stage(
+            manifest, PipelineStage.RESOLVE_SOURCE, StageStatus.SKIPPED,
+            message=f"{working_paper.record_class}: nothing to fetch",
+        )
+        self.manifest_store.update_stage(
+            manifest, PipelineStage.DOWNLOAD_PDF, StageStatus.SKIPPED,
+            message=f"{working_paper.record_class}: nothing to fetch",
+        )
+        manifest.batch_status = BatchStatus.PARTIAL_SUCCESS
+        manifest.stats["record_class"] = working_paper.record_class
+        self.manifest_store.save(manifest)
+        self._log(
+            index, total, self._ref(paper),
+            f"skipped: {working_paper.record_class} -- {working_paper.record_class_reason}",
+        )
+        return DownloadPipelineResult(
+            paper_key=working_paper.paper_key,
+            original_paper_key=paper.paper_key,
+            input_type=paper.input_type,
+            input_value=paper.input_value,
+            semantic_scholar_id=working_paper.semantic_scholar_paper_id,
+            title=working_paper.title,
+            downloaded=False,
+            reused_existing=False,
+            pdf_path=None,
+            status=f"skipped_{working_paper.record_class}",
+            manifest_path=str(self.manifest_store.path_for(working_paper.paper_key)),
+            failure_reason=None,
+            record_class=working_paper.record_class,
+            record_class_reason=working_paper.record_class_reason,
+            retracted=working_paper.retracted,
+        )
 
     def _prepare_paper(
         self, paper: PaperRecord, *, index: int, total: int
@@ -704,7 +995,7 @@ class DownloadOrchestrator:
                     index, total, self._ref(paper),
                     f"trying candidate {attempt_no} (round {round_no}) | {candidate.source_name} | {candidate.pdf_url}",
                 )
-                attempted_url = candidate.pdf_url
+                hop = _Hop(candidate_url=candidate.pdf_url)
                 try:
                     try:
                         result = self.downloader.download(
@@ -713,17 +1004,21 @@ class DownloadOrchestrator:
                             skip_if_valid=self.config.resume.verify_existing_files,
                         )
                     except NotAPDFError as exc:
-                        result, attempted_url = self._retry_via_landing_page(
-                            exc, candidate, output_pdf_path, index=index, total=total, paper=paper,
+                        hop.final_url = exc.final_url or None
+                        result = self._retry_via_landing_page(
+                            exc, candidate, output_pdf_path, hop,
+                            index=index, total=total, paper=paper,
                         )
+                    hop.final_url = result.final_url or hop.final_url
                     attempts.append({
                         "candidate_index": attempt_no,
                         "round": round_no,
                         "source_name": candidate.source_name,
-                        "pdf_url": attempted_url,
+                        "pdf_url": hop.attempted_url,
                         "status": "succeeded",
                         "error": None,
                         "result": result.to_dict(),
+                        **hop.trail(),
                     })
                     manifest.stats["download"] = result.to_dict()
                     manifest.stats["download_attempts"] = attempts
@@ -744,11 +1039,13 @@ class DownloadOrchestrator:
 
                 except Exception as exc:
                     last_error = str(exc)
+                    if isinstance(exc, NotAPDFError) and exc.final_url:
+                        hop.final_url = exc.final_url
                     attempts.append({
                         "candidate_index": attempt_no,
                         "round": round_no,
                         "source_name": candidate.source_name,
-                        "pdf_url": attempted_url,
+                        "pdf_url": hop.attempted_url,
                         "status": "failed",
                         "error": str(exc),
                         "http_status": getattr(exc, "status_code", None),
@@ -757,10 +1054,13 @@ class DownloadOrchestrator:
                         # about the paper. A caller deciding "is this paper worth another
                         # attempt" cannot tell from the status alone -- see host_gate.
                         "host_blocked": isinstance(exc, HostBlockedError),
-                        # ...and whether that was the deny list rather than an observed
-                        # refusal. The caller's stored detail must not confuse the two.
+                        # ...and which of the three kinds it was. All three read as "no PDF"
+                        # and all three have different remedies, so a caller that flattens
+                        # them retries the hopeless and gives up on the recoverable.
                         "host_denied": bool(getattr(exc, "denied", False)),
-                        "host": getattr(exc, "host", "") or host_gate.host_key(attempted_url),
+                        "host_challenged": bool(getattr(exc, "challenge", False)),
+                        "host": getattr(exc, "host", "") or host_gate.host_key(hop.attempted_url),
+                        **hop.trail(),
                     })
                     manifest.stats["download_attempts"] = attempts
                     self.manifest_store.save(manifest)
@@ -797,11 +1097,12 @@ class DownloadOrchestrator:
         exc: NotAPDFError,
         candidate: SourceCandidate,
         output_pdf_path: str,
+        hop: "_Hop",
         *,
         index: int,
         total: int,
         paper: PaperRecord,
-    ) -> tuple[DownloadResult, str]:
+    ) -> DownloadResult:
         """The URL served a web page. Look for the PDF link on it and try that, once.
 
         Most gold-OA DOIs resolve to an article page rather than a file, so without this a
@@ -815,6 +1116,11 @@ class DownloadOrchestrator:
 
         Re-raises the original NotAPDFError when the page offers nothing, so the caller
         still sees the real reason and moves on to the next candidate.
+
+        Every hop it takes is written into `hop`, so a failed follow-up is legible afterwards.
+        Without that the manifest recorded only the landing URL, and a Nature article page
+        that had actually been followed to a `.pdf` link and bounced straight back looked
+        identical to one that offered no link at all -- four extra requests to find out.
         """
         if not self.config.download.landing_page_fallback:
             raise exc
@@ -825,10 +1131,11 @@ class DownloadOrchestrator:
                 index, total, self._ref(paper),
                 f"{candidate.source_name} hit PMC's download interstitial | fetching from Europe PMC | {rewritten}",
             )
-            result = self.downloader.download(
+            hop.attempted_url = rewritten
+            hop.followed_from = exc.final_url or candidate.pdf_url
+            return self.downloader.download(
                 rewritten, output_pdf_path, skip_if_valid=self.config.resume.verify_existing_files,
             )
-            return result, rewritten
 
         landing_url = exc.final_url or candidate.pdf_url
         pdf_url = extract_pdf_url(exc.body, landing_url)
@@ -849,6 +1156,8 @@ class DownloadOrchestrator:
             index, total, self._ref(paper),
             f"{candidate.source_name} served a landing page | following its PDF link | {pdf_url}",
         )
+        hop.attempted_url = pdf_url
+        hop.followed_from = landing_url
         try:
             result = self.downloader.download(
                 pdf_url,
@@ -859,6 +1168,7 @@ class DownloadOrchestrator:
         except NotAPDFError as second:
             # The page's own PDF link may be the PMC interstitial (a PMC article page
             # links to its /pdf/ endpoint). Same rewrite, one more hop.
+            hop.final_url = second.final_url or hop.final_url
             rewritten = self._pmc_rewrite(second)
             if not rewritten:
                 raise
@@ -866,11 +1176,12 @@ class DownloadOrchestrator:
                 index, total, self._ref(paper),
                 f"{candidate.source_name}'s PDF link is PMC's download interstitial | fetching from Europe PMC | {rewritten}",
             )
-            result = self.downloader.download(
+            hop.followed_from = hop.attempted_url
+            hop.attempted_url = rewritten
+            return self.downloader.download(
                 rewritten, output_pdf_path, skip_if_valid=self.config.resume.verify_existing_files,
             )
-            return result, rewritten
-        return result, pdf_url
+        return result
 
     @staticmethod
     def _pmc_rewrite(exc: NotAPDFError) -> str | None:

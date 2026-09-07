@@ -37,6 +37,21 @@ class PaperRecord:
 
     local_pdf_path: str | None = None
 
+    #: What kind of record this is, when it is not an ordinary paper -- a meeting abstract, a
+    #: poster, a withdrawn preprint. Set by the classify stage from Crossref and OpenAlex
+    #: metadata before anything is fetched; None for the overwhelming majority. See
+    #: paper_downloader.metadata.record_class.
+    record_class: str | None = None
+    #: The signal that decided `record_class`, in a sentence. Kept because a terminal class
+    #: removes a paper from a review and someone will want to check why.
+    record_class_reason: str | None = None
+    #: The article has been retracted. Not a reason to stop fetching -- a retracted paper
+    #: usually still has a PDF, and a screener needs to see it to exclude it properly.
+    retracted: bool = False
+    #: Crossref's publication-online date, ``YYYY-MM-DD``. Used to tell "the publisher has
+    #: not posted the PDF yet" from "the publisher will not give it to us".
+    published_online: str | None = None
+
     external_ids: dict[str, Any] = field(default_factory=dict)
     source_urls: dict[str, str] = field(default_factory=dict)
     raw_metadata: dict[str, Any] = field(default_factory=dict)

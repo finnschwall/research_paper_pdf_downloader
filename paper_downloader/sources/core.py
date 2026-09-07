@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote
+
 
 import requests
 
@@ -24,6 +24,20 @@ def _domain_from_url(url: str | None) -> str | None:
         return domain or None
     except Exception:
         return None
+
+
+def _title_query(title: str) -> str:
+    """CORE's phrase search for a title.
+
+    The parentheses are load-bearing and easy to lose. `title:"Attention Is All You Need"`
+    returns 3.1 million hits -- the quotes are not honoured, so every common word matches
+    separately and the top five results are effectively random. `title:("Attention Is All
+    You Need")` returns 56. For a distinctive title both forms return the same one hit, so
+    the parenthesised form is never worse and is dramatically better for any title made of
+    ordinary words.
+    """
+    cleaned = title.strip().replace('"', " ")
+    return f'title:("{cleaned}")'
 
 
 @dataclass(slots=True)
@@ -59,19 +73,14 @@ class CORESourceProvider:
                     )
                 )
 
-        if not candidates and paper.arxiv_id:
-            works = self._search(f'arxivId:"{paper.arxiv_id.strip()}"', limit=3)
-            for work in works:
-                candidates.extend(
-                    self._candidates_from_work(
-                        work=work,
-                        exact_lookup=True,
-                        title_match_score=1.0 if paper.title else None,
-                    )
-                )
+        # There used to be an arXiv-id branch here. CORE has no queryable arXiv field --
+        # `arxivId:`, `arxiv:` and `identifiers.arxivId:` all answer HTTP 500 -- so it was a
+        # request that could only ever fail, and it made the provider look broken in the run
+        # log. Nothing is lost: the `arxiv` provider handles arXiv ids directly, and CORE's
+        # value here is repository copies of papers that are not on arXiv at all.
 
         if not candidates and self.resolution_config.allow_title_fallback and paper.title:
-            works = self._search(f'title:"{paper.title}"', limit=5)
+            works = self._search(_title_query(paper.title), limit=5)
             for work in works:
                 work_title = work.get("title") or work.get("displayTitle")
                 score = validate_title_match(paper.title, work_title)

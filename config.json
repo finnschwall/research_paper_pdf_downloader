@@ -19,7 +19,10 @@
       "core",
       "zenodo",
       "doaj",
+      "wiley",
+      "elsevier",
       "broad_search",
+      "openalex_content",
       "publisher_landing"
     ],
     "trusted_domains": [
@@ -46,7 +49,9 @@
       "core.ac.uk",
       "mdpi.com",
       "frontiersin.org",
-      "journals.plos.org"
+      "journals.plos.org",
+      "api.wiley.com",
+      "api.elsevier.com"
     ]
   },
   "download": {

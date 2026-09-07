@@ -1,178 +1,523 @@
-# Automated-Paper-Data-Retriever-System
+# Research paper retrieval
 
-This is an automated paper data retriever system which has is divided into two pipelines. The first part, **paper_metadata**, fetches academic paper metadata from Semantic Scholar by keyword-driven bulk search, deduplicates by paper ID and title across categories, and recovers missing metadata using multi-sources reterival systems. The second part, **paper_downloader**, resolves and downloads open-access PDFs for given paper identifiers across 11 source providers. Both pipelines are accessible from the command line and as a callable Python library via `paper_data.py`. This repository is under development.
+Two pipelines for the two halves of assembling a corpus of papers.
+
+**`paper_metadata`** finds papers: keyword searches against Semantic Scholar, deduplication,
+abstract recovery, and citation/reference snowballing.
+
+**`paper_downloader`** gets the PDFs: given a paper's identifier, it asks up to sixteen
+sources whether a copy exists, ranks what they offer, and downloads the best one.
+
+Both work from the command line and as a Python library through `paper_data.py`. If you only
+want the second one, read [Downloading PDFs](#downloading-pdfs) and
+[The providers](#the-providers) and skip the rest.
 
 ---
 
-## Table of Contents
+## Contents
 
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [API Keys and Environment Setup](#api-keys-and-environment-setup)
-- [Configuration](#configuration)
-  - [paper_downloader config.json](#paper_downloader-configjson)
-  - [paper_metadata config.json](#paper_metadata-configjson)
-- [Paper Metadata Pipeline](#paper-metadata-pipeline)
-  - [How It Works](#how-it-works)
-  - [search_queries.json](#search_queriesjson)
-  - [Workflow: preview → run → audit](#workflow-preview--run--audit)
-  - [Running from the CLI](#running-from-the-cli)
-  - [Programmatic Usage (paper_metadata)](#programmatic-usage-paper_metadata)
-  - [Fetching Metadata by ID](#fetching-metadata-by-id)
-  - [Citation and Reference Graph Retrieval](#citation-and-reference-graph-retrieval)
-  - [Output Structure (paper_metadata)](#output-structure-paper_metadata)
-- [SEER Ingest Bundle](#seer-ingest-bundle)
-  - [Bundle Layout](#bundle-layout)
-  - [manifest.json Fields](#manifestjson-fields)
-  - [papers.json Record Shape](#papersjson-record-shape)
-  - [_provenance Rules](#_provenance-rules)
-  - [Producing a Bundle (CLI)](#producing-a-bundle-cli)
-  - [Producing a Bundle (Python)](#producing-a-bundle-python)
-- [Input Formats (paper_downloader)](#input-formats-paper_downloader)
-- [Running the Download Pipeline](#running-the-download-pipeline)
-- [Output Structure (paper_downloader)](#output-structure-paper_downloader)
-- [Source Providers](#source-providers)
-- [Resume and Idempotency](#resume-and-idempotency)
-- [Programmatic Usage (paper_downloader)](#programmatic-usage-paper_downloader)
+- [What this does, and what it will not do](#what-this-does-and-what-it-will-not-do)
+- [Install](#install)
+- [Keys, and what each one buys](#keys-and-what-each-one-buys)
+- [Downloading PDFs](#downloading-pdfs)
+- [The providers](#the-providers)
+  - [How a paper is resolved](#how-a-paper-is-resolved)
+  - [Aggregators](#aggregators)
+  - [Venue providers](#venue-providers)
+  - [Publisher APIs](#publisher-apis)
+  - [Last resorts](#last-resorts)
+  - [Choosing which candidate to try first](#choosing-which-candidate-to-try-first)
+  - [Turning providers on and off](#turning-providers-on-and-off)
+- [When there is no PDF](#when-there-is-no-pdf)
+  - [Records with nothing to fetch](#records-with-nothing-to-fetch)
+  - [Why the fetch failed](#why-the-fetch-failed)
+  - [Bot walls, and why another machine does not help](#bot-walls-and-why-another-machine-does-not-help)
+- [Talking to publishers politely](#talking-to-publishers-politely)
+- [What a run leaves on disk](#what-a-run-leaves-on-disk)
+- [Finding papers: the metadata pipeline](#finding-papers-the-metadata-pipeline)
+- [Configuration reference](#configuration-reference)
 - [Troubleshooting](#troubleshooting)
+- [Using this from SEER](#using-this-from-seer)
 
 ---
 
-## Requirements
+## What this does, and what it will not do
 
-- Python 3.10 or higher
+It finds legally readable copies of papers and downloads them. It asks open-access
+aggregators, preprint servers, conference sites, institutional repositories and — where a
+publisher offers one and you have a key — that publisher's own text-and-data-mining API.
+
+It does not pretend to be a browser. Roughly a third of the papers it cannot get are open
+access, sitting on a publisher's own site under a Creative Commons licence, behind an edge
+network that refuses every client that is not a real browser. Cloudflare, Imperva, Radware
+and several publishers' own filters all do this. Libraries exist that defeat them by
+impersonating a browser's TLS fingerprint; using one would violate the "no scripts, spiders
+or robots" clause in essentially every institutional licence, so this library does not.
+
+What it does instead is tell you precisely which wall stopped it, and take the sanctioned
+route where one exists. For open-access articles that route is usually OpenAlex's full-text
+cache; for Wiley and Elsevier it is their TDM APIs; for the rest it is a person with a
+browser. See [Bot walls](#bot-walls-and-why-another-machine-does-not-help).
+
+It also refuses to guess. When a DOI turns out to be a meeting abstract, a poster or a
+withdrawn preprint, it says so and fetches nothing, rather than reporting a download failure
+for a document that does not exist.
 
 ---
 
-## Installation
+## Install
 
-Clone the repository and install the dependencies:
+Python 3.10 or newer.
 
 ```bash
 git clone https://github.com/Panzer3232/research_paper_pdf_downloader.git
 cd research_paper_pdf_downloader
 pip install -r requirements.txt
+pip install -e .            # makes `paper_data` importable from anywhere
 ```
 
-No other system dependencies are required. All output is written to a local `data/` directory that is created automatically on first run.
+Nothing else is required. Output goes to a `data/` directory created on first run.
 
 ---
 
-## API Keys and Environment Setup
+## Keys, and what each one buys
 
-API keys are read from a `.env` file in the project root directory.
-
-### Using the pipelines as a library from your own project folder
-
-This is the recommended setup for teams using `paper_data` as a library. You have your own project folder, cloned the repository separately, and call the functions from your own code. You do not need to create `.env` files inside the cloned repository at all.
-
-**Create a single `.env` file in your own project folder** — the folder where you run your script from:
-
-```
-/home/user/myproject/
-├── my_script.py
-└── .env                  ← place your .env here
-```
-
-That single `.env` file covers both pipelines. Use this format:
+Every key is optional and every one is free. A missing key switches its provider off; it
+never causes an error. Put them in a `.env` file in the directory you run from:
 
 ```
 SEMANTIC_SCHOLAR_API_KEY=
-OPENALEX_API_KEY=
 UNPAYWALL_EMAIL=
-CORE_API_KEY=
 CROSSREF_EMAIL=
+CORE_API_KEY=
+OPENALEX_API_KEY=
+WILEY_TDM_TOKEN=
+ELSEVIER_API_KEY=
+ELSEVIER_INST_TOKEN=
 ```
 
-**Always run your script from the folder that contains your `.env`:**
+| Variable | What it buys | How to get it |
+|---|---|---|
+| `SEMANTIC_SCHOLAR_API_KEY` | A higher rate limit on metadata lookups. Without it the shared pool throttles hard on large runs. | Request form, free |
+| `UNPAYWALL_EMAIL` | **The Unpaywall provider entirely.** Unpaywall returns nothing at all to an anonymous caller. | Any address you own — it is a contact, not an account |
+| `CROSSREF_EMAIL` | Crossref's "polite pool": faster, throttled less. | Same, no registration |
+| `CORE_API_KEY` | The CORE provider. Without it CORE's download links answer HTTP 400. | Free registration at core.ac.uk |
+| `OPENALEX_API_KEY` | A higher OpenAlex rate limit, **and** its full-text cache, which answers 401 without one. | Free, from OpenAlex |
+| `WILEY_TDM_TOKEN` | The only working route to a Wiley PDF. | Wiley's TDM page, after a click-through licence |
+| `ELSEVIER_API_KEY` | The only working route past ScienceDirect's bot check. | Self-service at dev.elsevier.com, minutes |
+| `ELSEVIER_INST_TOKEN` | Extends the Elsevier key to your institution's subscriptions. Optional. | Your library |
+
+Two things worth knowing about the last three.
+
+**They are metered or entitled, not simply "on".** OpenAlex's cache costs about $0.01 per
+PDF with roughly a hundred free per day, which is why the library asks it only after every
+free route has failed. Wiley's and Elsevier's APIs check your *network* as well as your
+token, so the same token works from a subscribing university and not from a laptop at home.
+
+**No key ever enters a URL.** Credentials are attached per host at the moment of the request
+([`core/credentials.py`](paper_downloader/core/credentials.py)), because a candidate URL is
+written to the paper's manifest, to the run's stats files, and — in SEER — to a stored source
+URL that everyone with an account can read.
+
+Shell environment variables take precedence over `.env`. Run your script from the directory
+holding the `.env`; both pipelines also search upwards from the working directory.
+
+---
+
+## Downloading PDFs
+
+### From Python
+
+```python
+from paper_data import download
+
+results = download("10.1016/j.websem.2024.100822")
+
+for r in results:
+    if r.downloaded:
+        print(r.pdf_path)
+    else:
+        print(r.status, "—", r.failure_reason, "—", r.error)
+```
+
+`download()` accepts a single identifier, a list of them, or a path to a JSON file. An
+identifier can be a DOI, an arXiv id, a Semantic Scholar id, a corpus id, or a prefixed form
+(`PMID:`, `PMCID:`, `ACL:`, `MAG:`). It can also be a full Semantic Scholar metadata record,
+which is faster — see below.
+
+Walking a list, open the downloader once:
+
+```python
+from paper_data import open_downloader
+
+with open_downloader(config=cfg) as dl:
+    for paper_id in ids:
+        result = dl.download_one(paper_id)
+        record(result)                      # your own progress reporting
+```
+
+`download()` rebuilds sixteen provider HTTP sessions and re-reads `config.json` on every
+call. The handle is **not** thread-safe — the providers hold `requests.Session` objects,
+which must not be shared. For parallelism, open one handle per thread; each thread needed
+those sessions anyway.
+
+**Pass a metadata record rather than a bare identifier when you have one.** Given only an
+identifier, the first thing the pipeline does is fetch the paper's Semantic Scholar record —
+and a paper whose metadata step fails is abandoned before arXiv or OpenAlex are asked at all,
+so one shared-pool HTTP 429 loses a paper arXiv would have served in a second. A record with
+a `title` and `externalIds` skips that call entirely and keeps the identifiers you already
+had.
+
+### From the command line
 
 ```bash
-cd /home/user/myproject
-python my_script.py
+python main.py --input your_papers.json
+python main.py --input "10.1016/j.websem.2024.100822"
+python main.py --input your_papers.json --config config.json
+python main.py --input your_papers.json --output enriched.json
+python main.py --input your_papers.json --stats-dir /path/to/stats --run-label batch_01
 ```
 
-Both loaders fall back to searching upward from the current working directory when no `.env` is found next to the pipeline's own `config.json`. As long as you run from your project folder, both pipelines will find your `.env` there automatically.
+`--output` writes a copy of the input JSON with `pdf_path`, `download_status` and
+`downloaded` added to each record. Without it, one is written next to the input as
+`<name>_enriched.json`.
 
----
+### What comes back
 
-## Configuration
+One `DownloadPipelineResult` per input paper, in input order.
 
-### paper_downloader config.json
-
-The `config.json` file controls all pipeline behaviour.
-
-**Fields worth knowing about:**
-
-| Field | What it controls |
+| Field | Meaning |
 |---|---|
-| `resolution.source_priority` | Which source providers run, and in what order. This is an **enable list**: a provider whose name is not here is never constructed, so it costs nothing. Names with no implementation are skipped with a warning. |
-| `resolution.stop_when_confident` | Stop querying further providers once one has returned a direct PDF link on a trusted host scoring at or above `stop_confidence_threshold`. With `prefer_publisher_version` on, only a publisher-version candidate can end the search, so preprint-only papers still consult every provider. Default on. |
-| `download.max_retries` / `retry_backoff_seconds` | Retries per candidate URL, with exponential backoff. Applied only to failures that could go the other way next time — connection errors, timeouts, 429, 5xx. A 401/403/404 is an answer, not a glitch, and is never retried. |
-| `download.landing_page_fallback` | When a candidate URL serves HTML instead of a PDF, parse that page for the real PDF link (`citation_pdf_url` meta tag, OJS download link, same-host `.pdf` anchor) and try it once. Most gold-OA DOIs point at an article page rather than a file, so this is the difference between "no PDF" and the PDF. Default on. |
-| `download.landing_page_max_bytes` | How much of such a page to read back before scanning it. |
+| `downloaded` / `pdf_path` | Whether there is a file, and where |
+| `status` | `downloaded`, `already_exists`, `failed_<code>`, or `skipped_<record class>` |
+| `failure_reason` | One word for why there is no PDF. `None` on success **and** on every `skipped_` status |
+| `record_class` | Set when this DOI is not an ordinary paper — see [Records with nothing to fetch](#records-with-nothing-to-fetch) |
+| `retracted` | The article has been retracted. Never stops a fetch; it is a flag for whoever screens the corpus |
+| `oa_asserted_by` | Providers that said a free copy exists. Non-empty on a failure means "open access, but this client could not reach it", which is not the same as "not free" |
+| `selected_source` | The candidate that won, with its provider, domain, licence and score |
+| `provider_attempts` / `download_attempts` | Every provider asked and every URL tried, with the reason each gave |
 
-**A note on speed.** `broad_search` queries DuckDuckGo once per trusted domain. If DuckDuckGo is unreachable from your network — some institutions block or sinkhole it — each of those queries costs a full `connect_timeout_seconds`, which can dominate the runtime of every paper. Drop `broad_search` from `source_priority` if so.
-
----
-
-### paper_metadata config.json
-
-Located at `paper_metadata/config.json`. Controls metadata fetch, deduplication, and abstract recovery behaviour.
-
-**Important fields:**
-
-| Field | What it controls |
-|---|---|
-| `output.base_dir` | Root directory where all `runs/` subdirectories are created. **Set this to your project folder** |
-| `search_queries_path` | Absolute path to `search_queries.json`. **Set this to your queries file location** |
-| `semantic_scholar.fields` | Comma-separated list of SS metadata fields returned per paper (returned columns, not search filters — stays in config) |
-
-To add new keyword queries or change search terms, edit `search_queries.json` directly; no code changes needed.
+Re-running is safe. A paper whose PDF is already on disk and whose manifest shows a completed
+download is skipped. A paper that previously *failed* is resolved again from scratch, on
+purpose: the candidate list on a failed manifest is a list of proven dead URLs, and replaying
+it would fail identically and would freeze the paper against every provider added since.
 
 ---
 
-## Paper Metadata Pipeline
+## The providers
 
-### How It Works
+### How a paper is resolved
 
-The pipeline runs five stages in sequence:
+A provider answers one question: *is there a copy of this paper, and where?* It returns
+candidates — a URL plus what is known about it (direct file or landing page, published
+version or preprint, licence, host, and whether the provider claims it is open access).
 
-**Stage 1 — Semantic Scholar bulk fetch.** For each query defined in `search_queries.json`, the pipeline runs a paginated bulk query against the Semantic Scholar API. Each query fetches up to 1000 papers per request and follows pagination tokens until all results are retrieved. Results are saved to `runs/<run_id>/raw/`.
+Resolution runs the providers in the order given by `resolution.source_priority` and **stops
+early** once one has produced a candidate good enough that nothing later could beat it: a
+direct link to a PDF, on a trusted host, above `stop_confidence_threshold`. With
+`prefer_publisher_version` on, only a publisher-version candidate can end the search, so a
+preprint-only paper still consults everyone.
 
-**Stage 2 — ID-based deduplication.** Within each query, papers sharing the same Semantic Scholar `paperId` are collapsed (intra-category dedup). Then, across all queries in priority order, any paper that already appeared in a higher-priority query is removed from lower-priority ones (inter-category dedup). Each paper ends up in exactly one query bucket. Results are saved to `runs/<run_id>/final/`.
+Then the download stage tries the candidates in rank order. **When they all fail, the chain
+resumes** where the early stop left it, and tries the new candidates too, until a download
+succeeds or no provider is left. This matters more than it sounds: in one production run, 12
+of 109 failed papers had stopped at an OpenAlex URL that then answered 403, with Europe PMC
+three providers further down holding a free copy nobody had asked for.
 
-**Stage 3 — Title-based deduplication.** The same paper can exist under two different `paperId` values (preprint + published version). Title-based dedup catches these: titles are normalised (lowercased, punctuation stripped, version suffixes removed) and compared. The version with the higher citation count is kept. Duplicate reports are saved as CSV files in `runs/<run_id>/reports/`. Results are saved to `runs/<run_id>/final_title_deduped/`.
+One more hop is allowed. Most gold-open-access DOIs resolve to an *article page* rather than
+a file, so when a candidate serves HTML the page is parsed for the real PDF link
+(`citation_pdf_url`, an OJS download link, a same-host `.pdf` anchor) and that link is tried
+once. Only links the page itself offers — no crawling, no guessing at URL patterns.
 
-**Stage 4 — API-based abstract recovery.** For papers with missing abstracts, the pipeline tries a chain of API sources: ArXiv (by ID and title), OpenAlex (by DOI and title), PubMed, ACL Anthology, EuropePMC (by DOI, PMID, and title), Crossref, CORE, and Semantic Scholar. Each source applies title similarity verification. Results are saved to `runs/<run_id>/final_recovered_abstract/`.
+### Aggregators
 
-**Stage 5 — Scrape-based abstract recovery.** For papers still missing an abstract, the pipeline scrapes the publisher webpage via the paper's DOI. Publisher-specific parsers cover Springer, Nature, IEEE, Elsevier, Wiley, Taylor & Francis, Oxford UP, Cambridge UP, Frontiers, MDPI, ACM, PLOS, AAAI, and IJCAI, with a generic JSON-LD fallback. Results are saved to `runs/<run_id>/publisher_scraped/`.
+These index open-access copies across all publishers. They are asked first because a
+repository copy costs the publisher nothing and is not behind a bot wall.
 
----
+| Provider | What it asks | Key | Notes |
+|---|---|---|---|
+| `metadata_open_access` | The `openAccessPdf` URL already in the Semantic Scholar record | — | Free, no request at all. A `doi.org` URL here is skipped rather than followed — see `publisher_landing` for why |
+| `openalex` | OpenAlex's locations for the DOI, then by title | Optional | The broadest coverage of the four. Any PMC id it reports is rewritten to Europe PMC |
+| `unpaywall` | Unpaywall's OA locations for the DOI | **Email required** | Off entirely without `UNPAYWALL_EMAIL` |
+| `europepmc` | Europe PMC's own full-text holdings | — | Keyed on `inEPMC` + `hasPDF`, *not* on the open-access flag: author manuscripts under a funder mandate are flagged "not OA" and served freely anyway. Gating on the flag dropped exactly those |
+| `crossref` | The `link[]` array on the Crossref record | Optional (email) | Skips `similarity-checking` links (iThenticate feeds, all behind the publisher wall) and staging hosts |
+| `core` | CORE's index of institutional repositories | **Key required** | Answers HTTP 400 without a key. Titles are searched as `title:("…")`; without the parentheses CORE ignores the quotes — "Attention Is All You Need" matches 3.1 million records instead of 56. CORE has no queryable arXiv-id field at all (`arxivId:` and every variant answer HTTP 500), so it is never asked by arXiv id |
+| `doaj` | The Directory of Open Access Journals | — | |
+| `zenodo` | Zenodo deposits | — | |
 
-### search_queries.json
+Every PMC identifier, wherever it comes from, is fetched from **Europe PMC** rather than PMC
+itself: PMC's own PDF endpoint answers with a "preparing your download" page that needs
+JavaScript, and Europe PMC serves the identical file directly.
 
-This file defines the keyword queries used to fetch papers from Semantic Scholar. It has two top-level keys:
+### Venue providers
 
-- **`defaults`** — search parameters applied to every query unless overridden.
-- **`queries`** — a map of query IDs to query entries. Each entry must have a `"query"` string and can override any default.
+These construct a URL from what the paper *is*, without asking an index. They are the
+fastest and most reliable routes when they apply.
 
-Query IDs become the filenames for all output JSON files throughout the pipeline. The order of IDs determines inter-query deduplication priority: papers matching multiple queries are assigned to the first matching one.
-
-The Semantic Scholar bulk search supports Boolean operators `|` (OR), `+` (AND), and quoted phrases.
-
-**Supported parameter keys** (in `defaults` or per-query):
-
-| Key | SS API param | Example |
+| Provider | Applies to | How |
 |---|---|---|
-| `date_range` | `publicationDateOrYear` | `"2020-01-01:"` |
-| `min_citations` | `minCitationCount` | `5` |
-| `publication_types` | `publicationTypes` | `"JournalArticle,Conference"` |
-| `venue` | `venue` | `"NeurIPS,ICML"` |
-| `fields_of_study` | `fieldsOfStudy` | `"Computer Science"` |
-| `open_access_pdf` | `openAccessPdf` | `true` |
-| `year` | `year` | `"2022-2024"` |
+| `arxiv` | Anything with an arXiv id | Builds the PDF URL directly. Without an id, searches the arXiv API by title and accepts a hit only when the **authors also overlap** — a title alone is how a review ends up citing the wrong paper. Withdrawn preprints are recognised and never offered |
+| `acl` | ACL Anthology papers | From the ACL id, or from a `10.18653/v1/…` DOI |
+| `cvf` | CVPR, ICCV, ECCV, WACV | Matches the title against the venue's index page, because these papers carry an IEEE DOI that IEEE will not serve. For a computer-vision corpus this is most of the papers |
 
-**Example:**
+### Publisher APIs
+
+Where a publisher's website refuses scripts but the publisher offers a sanctioned API, this
+is the route. Each is inert until its key is set, and each fires only for DOIs registered to
+that publisher — a prefix check that costs nothing for everyone else's papers.
+
+**`wiley`** — `onlinelibrary.wiley.com` is behind a Cloudflare browser challenge, including
+for articles published under a Creative Commons licence, so no HTTP client gets a PDF from
+it. `api.wiley.com/onlinelibrary/tdm/v1/articles/{DOI}` does serve one. Details that are easy
+to get wrong: the DOI's slash must be percent-encoded (an unencoded DOI returns an empty 404,
+indistinguishable from "no such article"); the response is a redirect to a single-use signed
+URL, so the `api.wiley.com` address is what gets recorded as the source; a missing token gives
+400, not 401; and the published rate limit of 60 requests per 10 minutes is the binding one,
+so the library waits 10 seconds between requests to this host.
+
+**`elsevier`** — `sciencedirect.com` answers a non-browser with a 403 and an 800 KB HTML page,
+and `linkinghub.elsevier.com`, where every Elsevier DOI redirects, serves a JavaScript
+redirect to that same wall. The Article Retrieval API returns the PDF instead. Its trap is
+that a request you are *not* entitled to comes back as a valid PDF of the article's **first
+page only** — right paper, right format, right size, and silently not the paper. The library
+reads Elsevier's own entitlement header rather than trying to judge the document, and fails
+the candidate honestly. *This provider is unverified: no Elsevier key was available when it
+was written. Treat your first run with a real key as its test.*
+
+**`openalex_content`** — OpenAlex caches the full text of the open-access works it indexes and
+serves the file from `content.openalex.org`. This is the answer for the largest category of
+unreachable paper: an MDPI, ACM or IOP article that is free to read under CC-BY and that no
+script can fetch from the publisher. It is a separate provider from `openalex`, placed
+near the end of the chain and marked *fallback only*, for one reason — **it costs money**,
+about a cent a file against a free daily allowance of roughly a hundred. Both mechanisms are
+needed. Its position means the provider is usually not even asked. Its fallback-only mark
+means that when it *is* asked — which is exactly the case for a paper whose other copies are
+all on walled hosts — its candidate still sorts below every free one, so a repository copy is
+downloaded first and the cent is spent only when nothing free worked. The licence on a cached
+PDF is the article's own; OpenAlex grants no extra rights, so it only offers files the work
+record marks as open access.
+
+### Last resorts
+
+| Provider | What it does | Why it is last |
+|---|---|---|
+| `broad_search` | A DuckDuckGo search scoped to each trusted domain | Lowest confidence of anything here. On a network where DuckDuckGo is blocked it costs eight connect timeouts per paper and finds nothing — drop it from `source_priority` |
+| `publisher_landing` | The publisher's own article page, from Crossref's `resource.primary.URL` | It asks the publisher, which every provider above exists to avoid. But on a university network it recovers subscription articles nobody else can offer: a measured 5 of 110 missing papers in one review, none of which had ever been asked for |
+
+`publisher_landing` is marked *fallback only*: it sorts below every other candidate whatever
+it scores, and never ends the provider search. It uses Crossref's `resource.primary.URL`
+rather than `https://doi.org/<doi>` deliberately — a `doi.org` URL would be rate-limited under
+doi.org rather than under the publisher, would be sent the User-Agent chosen for the wrong
+host, and would record "doi.org" as the paper's provenance instead of the page actually read.
+
+### Choosing which candidate to try first
+
+Ranking has two layers.
+
+**A categorical sort** decides first, as a tuple: not-fallback-only, then publisher version,
+then direct `.pdf` link, then publisher-hosted. A confirmed version of record outranks a
+preprint whatever the scores say.
+
+**A quality score** breaks ties, built from independent additive signals: direct PDF link
+`+0.20`; domain in `trusted_domains` `+0.20`; publisher version `+0.30` (or `+0.15` when
+`prefer_publisher_version` is off), accepted manuscript `+0.20`, preprint `+0.10` (or `−1.00`
+when `allow_preprints` is off); publisher host `+0.10`, repository host `+0.05`; title
+similarity at or above the threshold `+0.10`, below it `−0.20`. Finally the provider's own
+confidence — from 0.62 for `broad_search` up to 0.97 for the ACL Anthology — contributes at
+most `+0.10`, so the pipeline's structural signals always outweigh any provider's opinion of
+itself.
+
+Duplicate URLs across providers are collapsed, keeping the higher score. Every candidate's
+full breakdown is written to the manifest under `stats.resolution.all_candidates`.
+
+### Turning providers on and off
+
+`resolution.source_priority` is both the order and the enable list. A provider whose name is
+not in it is never constructed, so it costs nothing. Unknown names are skipped with a
+warning. The shipped default:
+
+```json
+["metadata_open_access", "arxiv", "acl", "cvf", "openalex", "unpaywall", "europepmc",
+ "crossref", "core", "zenodo", "doaj", "wiley", "elsevier", "broad_search",
+ "openalex_content", "publisher_landing"]
+```
+
+Free and fast first, publisher APIs after the free aggregators, the metered cache and the
+publisher's own website last.
+
+---
+
+## When there is no PDF
+
+Three questions, deliberately kept apart, because they have completely different answers.
+
+### Records with nothing to fetch
+
+Before anything is requested, the pipeline reads the Crossref and OpenAlex records and asks
+what kind of thing this DOI *is*. A meeting abstract, a poster deposit, a withdrawn preprint
+and an erratum are not papers with missing PDFs; there is no full text anywhere, and no
+number of retries will produce one.
+
+When the answer is one of these, resolution and download are skipped entirely — no provider
+is asked, no publisher is contacted — and the result comes back as `status =
+"skipped_<class>"` with `failure_reason = None`.
+
+| `record_class` | What it is | How it is recognised |
+|---|---|---|
+| `conference_abstract` | The DOI *is* the abstract | OpenAlex's `conference-abstract` type; or a Crossref supplement issue of an abstract book; or a conference's own numbering in the title (AACR's "Abstract 4137:", ESMO's "316P", ATS session codes) **corroborated** by a supplement or abstract-book container |
+| `poster` | A poster deposit | The `10.26226` prefix (Morressier); Crossref `posted-content` with no real subtype |
+| `withdrawn` | Pulled by its authors or by the server | arXiv's own withdrawal note |
+| `correction` | An erratum or corrigendum | Title, or Crossref's `update-to` |
+| `paratext` | Front matter, an issue cover, an editorial board page | OpenAlex's `is_paratext`; Crossref `journal-issue` |
+| `not_an_article` | A dataset, a peer-review report, a whole book, a standard | Crossref `type` |
+
+`retracted` is deliberately **not** in this list. A retracted article usually still has a PDF,
+and whoever screens the corpus needs to see it in order to exclude it on purpose rather than
+by accident — so it is a flag on the result and the fetch proceeds normally.
+
+Three signals were tried and rejected, and should not be added back: Semantic Scholar's
+`publicationTypes` (it says `JournalArticle` for abstracts, posters and withdrawn preprints
+alike); a single-page page range (MDPI and IOP article numbers look identical to abstract
+numbers); and a bare `^Abstract\b` title match (it hits real papers about abstraction).
+
+The two metadata lookups this needs are cached and reused by the `crossref`, `openalex` and
+`publisher_landing` providers, so classification costs close to nothing.
+
+### Why the fetch failed
+
+For records that *are* papers, `failure_reason` says what happened. When several attempts
+disagree, the first match in this order wins — which is also the order of how little the
+result tells you about the paper itself.
+
+| Reason | Meaning | Worth retrying? |
+|---|---|---|
+| `client_challenged` | A bot wall refused a non-browser client. Says nothing about the paper, the address, or the rate | Not as-is. A publisher API or the OpenAlex cache is the route |
+| `host_refused_client` | An edge denial shaped like a rate or IP limit — 429, `Retry-After`, a refusal that clears elsewhere | Later, or from a different network |
+| `host_denied` | A host on the configured deny list was never asked | When the configuration changes |
+| `transient` | 5xx, timeout, network error, metadata lookup failed | Yes |
+| `page_without_link` | A real article page with no followable PDF link: a JavaScript download button, a repository record with nothing deposited | Not by machine |
+| `withdrawn` | The arXiv copy was withdrawn | No |
+| `not_yet_available` | Published days ago; the publisher serves HTML and no PDF to anyone yet | Yes, in a few weeks — the one reason time alone fixes |
+| `not_free` | Every source says closed, or 401/403 on the article with no free copy anywhere | Not without entitlement |
+| `dead_link` | Every URL on record answers 404, and the record is not withdrawn | Rarely |
+
+Alongside this, `oa_asserted_by` names the providers that claimed a free copy exists. A
+failure with a non-empty `oa_asserted_by` is "open access, and this client could not reach
+it" — a fact about the client, not about the paper, and a different thing from `not_free`.
+
+### Bot walls, and why another machine does not help
+
+This was measured rather than assumed. Every refusal was re-tested from a second machine, on
+a different network, in a different country, on a different provider. Every one answered
+identically. A `curl` control with a Chrome User-Agent got the same refusals as Python
+`requests`. **The discriminator is not the address and not the User-Agent — it is that the
+client is not a browser.**
+
+| Wall | Hosts | What you see |
+|---|---|---|
+| Cloudflare | ACM, ACS, Taylor & Francis, OUP, ASME, Wiley, Sage, Emerald, AACR, SSRN | 403, `Cf-Mitigated: challenge`, "Just a moment…" |
+| Edge bot filter | MDPI | 403, a 400-byte "Access Denied" page |
+| Elsevier's own | ScienceDirect | 403 with an 800 KB HTML page and no marker to find |
+| IEEE's own | IEEE Xplore | 202 with an empty body |
+| Radware | IOP | HTML, then a redirect to a captcha |
+| Imperva Incapsula | some repository mirrors | A 212-byte page that loads a JavaScript challenge |
+
+So moving machines is not a fix, and the library does not treat these as a rate problem. A
+challenge gets a flat one-hour skip and its own failure reason; only genuinely rate- or
+IP-shaped refusals climb the escalating cool-off below. Feeding a first-request bot wall into
+that ladder would have waited out a rate limit that was never there and escalated to a
+48-hour self-block for something no amount of waiting can change.
+
+Two of these are worth knowing about specifically. The 212-byte Incapsula page used to be
+reported as "file too small to be a valid PDF" — the size check ran before the content check,
+so the page was never read, and the obvious-looking fix (raise the size limit) would have
+changed nothing. And Elsevier's 800 KB page is too big for a size heuristic and carries no
+recognisable boilerplate, so a small list of hosts *measured* to bot-check every script is
+consulted as well as the markers.
+
+---
+
+## Talking to publishers politely
+
+Publishers measure requests per second, from one address, to one host. A worker count cannot
+express that — three workers doing 300 ms fetches is ten requests a second — and it cannot be
+declared in advance either, because *which* publisher host a PDF comes from is the output of
+resolution, not something a caller could route on. So the limit lives at the host, in
+[`core/host_gate.py`](paper_downloader/core/host_gate.py), and every outbound request in the
+library passes through it.
+
+Two knobs per host: a minimum gap between request starts (the rate), and how many may be in
+flight at once (the overlap, so one slow response does not idle the host). Anything not named
+gets one request per second, one at a time. That default is deliberately pessimistic; the fast
+lane is a whitelist of hosts known to tolerate us, which is the only direction it is safe to
+guess in.
+
+The gate also notices when a host stops answering and starts *refusing*. Rate- and IP-shaped
+refusals are remembered in a JSON file under the data root and escalate — 15 minutes, then
+6 hours, then 48 — because a ban is a fact about this client and this host, and a fresh
+process should not have to earn it again. Bot challenges are tracked separately, with a flat
+one-hour skip and no escalation and no persistence, for the reasons above.
+
+**Rate state is per process.** The limiter is module-level, so it bounds one Python process.
+Several processes each get their own gate and the effective rate multiplies.
+
+Publisher API hosts are exempt from refusal-blocking: those answer "you are not entitled to
+*this article*" with a small 403, byte-for-byte the shape of an edge denial, and reading it as
+one would let a single unentitled article block the API for every entitled paper behind it.
+
+---
+
+## What a run leaves on disk
+
+```
+data/
+  pdfs/          arxiv__2410.20513.pdf, doi__10.1016_j.websem.2024.100822.pdf, …
+  metadata/      the paper record as it was known, including recovered identifiers
+  manifests/     per-paper processing history
+  reports/       download_stats_<UTC timestamp>_{full.json,short.json,short.csv}
+  host_refusals.json
+```
+
+Files are named by **paper key**, derived from the best available identifier: `doi__…`,
+`arxiv__…`, `ss__…`, `corpus__…`.
+
+A **manifest** is the per-paper record of what happened: every stage with its status and
+timestamps, every provider asked and what it said, every URL tried and how it failed, and the
+candidate that won. It is also the resume state. A failed attempt records not just the URL
+the candidate named but the link that was followed off a landing page and where the request
+finally ended, so a two-hop failure is legible afterwards — without that, a Nature article
+page that *had* been followed to a `.pdf` link that bounced straight back looked exactly like
+one that offered no link at all.
+
+**Stats** are written once per run, timestamped so no run overwrites another: `_full.json`
+with everything, `_short.json` with one row per paper, `_short.csv` for a spreadsheet.
+
+---
+
+## Finding papers: the metadata pipeline
+
+`paper_metadata` builds the corpus that `paper_downloader` then fetches. Five stages:
+
+1. **Bulk fetch** — each query in `search_queries.json` is run against Semantic Scholar's
+   bulk endpoint, paginated to exhaustion. → `raw/`
+2. **Deduplicate by id** — within each query, then across queries in priority order, so each
+   paper ends up in exactly one bucket. → `final/`
+3. **Deduplicate by title** — catches the same paper under two ids (preprint and published
+   version); keeps the more-cited one. Duplicate reports are written as CSV. →
+   `final_title_deduped/`
+4. **Recover abstracts by API** — arXiv, OpenAlex, PubMed, ACL, Europe PMC, Crossref, CORE
+   and Semantic Scholar in turn, each verified by title similarity. →
+   `final_recovered_abstract/`
+5. **Recover abstracts by scraping** — publisher-specific parsers for Springer, Nature, IEEE,
+   Elsevier, Wiley, Taylor & Francis, OUP, CUP, Frontiers, MDPI, ACM, PLOS, AAAI and IJCAI,
+   with a JSON-LD fallback. → `publisher_scraped/`
+
+### Queries
+
+`search_queries.json` has `defaults` (applied to every query) and `queries` (a map of query id
+to entry, each with a `"query"` string and any overrides). Query ids become output filenames,
+and their order sets deduplication priority. The Semantic Scholar bulk search supports `|`
+(OR), `+` (AND) and quoted phrases.
 
 ```json
 {
@@ -182,743 +527,216 @@ The Semantic Scholar bulk search supports Boolean operators `|` (OR), `+` (AND),
     "publication_types": "JournalArticle,Conference,Dataset,Study"
   },
   "queries": {
-    "1_xai_llm": {
-      "query": "(\"explainable AI\" | XAI) + (LLM | \"large language model\")"
-    },
-    "2_saes_llm": {
-      "query": "(\"sparse autoencoder\" | SAE) + (LLM | transformer)",
-      "min_citations": 5
-    }
+    "1_xai_llm": { "query": "(\"explainable AI\" | XAI) + (LLM | \"large language model\")" },
+    "2_saes_llm": { "query": "(\"sparse autoencoder\" | SAE) + (LLM | transformer)",
+                    "min_citations": 5 }
   }
 }
 ```
 
-Each query is an atomic, self-contained search. If you need the same topic with different date ranges or citation thresholds, write two query entries — one for each set of parameters.
+Parameter keys: `date_range` (`publicationDateOrYear`), `min_citations`, `publication_types`,
+`venue`, `fields_of_study`, `open_access_pdf`, `year`. Each query is atomic — for the same
+topic with two date ranges, write two entries.
 
----
-
-### Workflow: preview → run → audit
-
-The recommended workflow for systematic reviews follows three steps:
-
-**1. Preview** — check how many results each query will surface before committing to a full fetch:
+### Preview, run, audit
 
 ```bash
-python -m paper_metadata.export preview \
-  --search-queries-path paper_metadata/search_queries.json
-```
+# 1. How many results will each query surface? One light request per query, no data fetched.
+python -m paper_metadata.export preview --search-queries-path paper_metadata/search_queries.json
 
-Or in Python:
-```python
-counts = preview_queries(search_queries_path="paper_metadata/search_queries.json")
-# {'1_xai_llm': 4821, '2_saes_llm': 312, ...}
-```
+# 2. Run it.
+python -m paper_metadata.export keyword --base-dir /data/myproject --label "xai-sweep-june"
 
-Preview makes one lightweight API request per query (no paper data is fetched). Use it to tune queries before running the full pipeline.
-
-**2. Run** — execute the full pipeline:
-
-```bash
-python -m paper_metadata.export keyword \
-  --base-dir /data/myproject \
-  --label "xai-sweep-june" \
-  --no-recovery
-```
-
-Each run creates a timestamped directory under `<base_dir>/runs/`:
-
-```
-runs/
-  20260628-142300_xai-sweep-june/
-    run.json                  ← written at start; updated on completion
-    search_queries.json       ← exact snapshot of queries used
-    raw/
-    final/
-    final_title_deduped/
-    final_recovered_abstract/
-    publisher_scraped/
-    reports/
-    seer_ingest/
-```
-
-`run.json` records the run ID, label, start/end times, status, and per-query paper counts.
-
-**3. Audit** — inspect past runs at any time:
-
-```bash
+# 3. Look at what past runs did.
 python -m paper_metadata.export list-runs --base-dir /data/myproject
 ```
 
-Or in Python:
-```python
-runs = list_runs("/data/myproject")
-for r in runs:
-    print(r.run_id, r.status, r.counts)
-```
+The same three in Python: `preview_queries()`, `fetch_metadata()`, `list_runs()`. Also
+`sample_queries(n=20)` for the first few papers per query as a sanity check, and
+`recover_abstracts(input_dir=…)` to re-run stages 4 and 5 over an existing run.
 
-Each run directory is fully self-contained: the `search_queries.json` snapshot inside it records exactly what was searched, and `run.json` records the parameters and counts. This satisfies PRISMA documentation requirements for systematic reviews.
+Each run creates `<base_dir>/runs/<timestamp>_<label>/` holding one directory per stage, a
+`reports/` directory, a snapshot of the exact queries used, and `run.json` recording the id,
+label, timings, status and per-query counts. That snapshot is what makes a run reproducible
+and is what PRISMA documentation needs.
 
----
-
-### Running from the CLI
-
-All commands are run from the **parent directory** of `paper_metadata/` using Python's `-m` flag.
-
-**Preview query result counts (no data fetched):**
-
-```bash
-python -m paper_metadata.export preview \
-  --search-queries-path paper_metadata/search_queries.json
-```
-
-**Full pipeline:**
-
-```bash
-python -m paper_metadata.export keyword \
-  --base-dir /path/to/project \
-  --label "my-run-label"
-```
-
-**Full pipeline with explicit queries file:**
-
-```bash
-python -m paper_metadata.export keyword \
-  --base-dir /path \
-  --search-queries-path /path/to/search_queries.json \
-  --label "sweep-v2"
-```
-
-**List past runs:**
-
-```bash
-python -m paper_metadata.export list-runs --base-dir /path/to/project
-```
-
----
-
-### Programmatic Usage (paper_metadata)
+### By id, and by citation graph
 
 ```python
-from paper_data import fetch_metadata, preview_queries, list_runs, recover_abstracts
+from paper_data import fetch_papers_by_id, fetch_citations_and_references
 
-# Preview result counts before fetching
-counts = preview_queries(search_queries_path="/path/to/search_queries.json")
-# {'1_xai_llm': 4821, '2_saes_llm': 312, ...}
+papers = fetch_papers_by_id(["2106.15928", "DOI:10.18653/v1/N18-3011"], api_recovery=True)
 
-# Full pipeline — creates runs/<timestamp>/ under base_dir
-fetch_metadata(
-    base_dir="/path",
-    search_queries_path="/path/to/search_queries.json",
-    label="xai-sweep-june",            # optional, appended to run directory name
-)
-
-# Full pipeline with default config
-fetch_metadata()
-
-# Fetch and dedup only, no recovery
-fetch_metadata(api_recovery=False, scrape_recovery=False)
-
-# List all past runs sorted newest-first
-runs = list_runs("/path")
-for r in runs:
-    print(r.run_id, r.status, r.label)
-    print(r.counts)           # {query_id: {"raw": ..., "final": ...}}
-    print(r.run_dir)          # Path to the run directory
-
-# Run recovery stages on already-fetched data in a prior run's directory
-recover_abstracts(
-    "/path/runs/20260628-142300_xai-sweep-june/final_title_deduped"
-)
-
-# API recovery only
-recover_abstracts(
-    "/path/runs/.../final_title_deduped",
-    scrape_recovery=False,
-)
-
-# Scrape recovery only on files that already went through API recovery
-recover_abstracts(
-    "/path/runs/.../final_recovered_abstract",
-    api_recovery=False,
-)
-```
-
----
-
-### Fetching Metadata by ID
-
-Use `fetch_papers_by_id` to retrieve full paper metadata for one or more known identifiers without running the keyword search pipeline. Accepts Semantic Scholar paper IDs, DOIs, ArXiv IDs, or any explicitly prefixed identifier (`ARXIV:`, `DOI:`, `ACL:`, `MAG:`, `PMID:`, `PMCID:`, `CorpusId:`). Returns a list of paper dicts in memory — no files are written to disk.
-
-```python
-from paper_data import fetch_papers_by_id
-
-# Single paper — any supported ID type
-papers = fetch_papers_by_id("2410.20513")
-papers = fetch_papers_by_id("10.1016/j.websem.2024.100822")
-papers = fetch_papers_by_id("649def34f8be52c8b66281af98ae884c09aef38b")
-
-# Batch — mixed ID types in one call
-papers = fetch_papers_by_id([
-    "2410.20513",
-    "DOI:10.1145/1234567.1234568",
-    "CorpusId:215416146",
-])
-
-# With abstract recovery for papers missing one after the SS fetch
-papers = fetch_papers_by_id(ids, api_recovery=True, scrape_recovery=True)
-
-# Iterate results
-for p in papers:
-    if p["_fetch_status"] == "found":
-        print(p["title"], p.get("abstract", "—"))
-    else:
-        print(p["_input_id"], "→", p["_fetch_status"])
-```
-
-Each result carries `_input_id` (the original identifier supplied) and `_fetch_status` (`found`, `not_found`, or `invalid_id`). Abstract recovery does not run automatically; pass `api_recovery=True` or `scrape_recovery=True` to opt in. Bare numeric IDs are rejected — prefix them explicitly (`CorpusId:`, `PMID:`, or `MAG:`).
-
----
-
-### Citation and Reference Graph Retrieval
-
-`fetch_citations_and_references` fetches citation and reference edges for one or more papers via two independent Semantic Scholar endpoints: `/paper/{id}/citations` (papers that cite the target) and `/paper/{id}/references` (papers cited by the target). Both are called by default and can be toggled independently. Returns one `PaperGraphResult` per input identifier.
-
-#### Usage
-
-```python
-from paper_data import fetch_citations_and_references, CitationGraphOptions
-
-# Both endpoints, all defaults
-results = fetch_citations_and_references("2106.15928")
-
-# Batch — citations only, influential papers, capped at 200, saved to disk
 results = fetch_citations_and_references(
-    [
-        "1509b5dd76b251d61cd03f0bc26521da50edcf37",
-        "1a1e99514d8d175459f7c61cfd0c394b46e63359",
-    ],
-    references=False,
-    influential_only=True,
-    max_results=200,
-    save_dir="/path/to/output",
-)
-
-# Fine-grained control — different options per endpoint
-results = fetch_citations_and_references(
-    paper_batch,
-    citation_options=CitationGraphOptions(influential_only=True, max_results=200),
-    reference_options=CitationGraphOptions(influential_only=False),
-    save_dir="/path/to/output",
-)
-
-# Iterate results
-for r in results:
-    if r.error:
-        print(r.input_id, "→ failed:", r.error)
-    else:
-        print(r.input_id, "→", len(r.citations), "citations,", len(r.references), "references")
-```
-
-Shorthand kwargs (`influential_only`, `max_results`, `fields`, `publication_date_filter`) apply identically to both endpoints. When `citation_options` or `reference_options` is provided for an endpoint, all shorthand kwargs are ignored for that endpoint — mixing both raises `ValueError`.
-
-#### Parameters
-
-| Parameter | Default | Description |
-|---|---|---|
-| `citations` | `True` | Call the `/citations` endpoint |
-| `references` | `True` | Call the `/references` endpoint |
-| `influential_only` | `False` | Filter to edges where `isInfluential=True` (post-fetch in Python; all pages are still fetched) |
-| `max_results` | `None` | Cap on edges fetched per endpoint per paper; `None` fetches all up to the API ceiling (~9,999) |
-| `fields` | `None` | Comma-separated SS fields per returned paper (e.g. `"paperId,title,year"`); falls back to `config.json` default |
-| `publication_date_filter` | `None` | Date range for **citations only**; ignored for references. Format: `"YYYY-MM-DD:YYYY-MM-DD"`, open-ended (`"2020-01-01:"`) accepted |
-| `citation_options` | `None` | `CitationGraphOptions` for fine-grained citations control; overrides all shorthand kwargs for citations |
-| `reference_options` | `None` | `CitationGraphOptions` for fine-grained references control; overrides all shorthand kwargs for references |
-| `save_dir` | `None` | Directory to write JSON output; created automatically if absent |
-
-`influential_only` relies on Semantic Scholar's ML model, which identifies citations where the cited work had significant impact on the citing paper based on citation count and surrounding context. See [Valenzuela et al., 2015](https://www.semanticscholar.org/paper/Identifying-Meaningful-Citations-Valenzuela-Ha/1c7be3fc28296a97607d426f9168ad4836407e4b) for the methodology. Note that `citations_fetched` / `references_fetched` on the result always reflect the raw pre-filter count.
-
-#### Output structure (when save_dir is set)
-
-```
-save_dir/
-  citations/<paper_id>.json
-  references/<paper_id>.json
-  fetch_summary.json
-```
-
-Each per-paper file records `fetched` (raw count), `returned` (after filtering), `truncated`, and the `papers` list. `fetch_summary.json` covers every paper with per-endpoint `status` values: `success`, `empty`, `truncated`, `failed`, or `not_requested`.
-
-#### PaperGraphResult fields
-
-| Field | Type | Description |
-|---|---|---|
-| `input_id` | `str` | Original identifier supplied by the caller |
-| `paper_id` | `str \| None` | Normalised identifier sent to the API; `None` on error |
-| `citations` | `list[dict]` | Citing papers (empty if not requested or on error) |
-| `references` | `list[dict]` | Cited papers (empty if not requested or on error) |
-| `citations_fetched` / `references_fetched` | `int` | Raw edge count before `influential_only` filtering |
-| `citations_truncated` / `references_truncated` | `bool` | `True` if the API ceiling (~9,999) was hit |
-| `error` | `str \| None` | Error message on lookup failure; `None` on success |
-
-#### Identifier formats and API limits
-
-Accepted formats are the same as `fetch_papers_by_id`: 40-char hex SS IDs, DOIs (`10.XXXX/...`), ArXiv IDs (`2106.15928`), URLs, and explicitly prefixed identifiers (`DOI:`, `ARXIV:`, `CorpusId:`, `PMID:`, `PMCID:`, `MAG:`, `ACL:`). Bare numeric strings are rejected — use an explicit prefix (e.g. `"CorpusId:12345678"`).
-
-The API silently truncates at ~9,999 edges per endpoint; `citations_truncated` / `references_truncated` signal this. Set `SEMANTIC_SCHOLAR_API_KEY` in `.env` to raise rate limits. The inter-paper delay in batch calls is controlled by `request_delay` in the `citation_graph` section of `paper_metadata/config.json`.
-
----
-
-### Output Structure (paper_metadata)
-
-Each pipeline run creates a timestamped directory under `<base_dir>/runs/`:
-
-```
-<base_dir>/
-  runs/
-    20260628-142300_xai-sweep-june/
-      run.json                      # run metadata: status, timestamps, per-query counts
-      search_queries.json           # snapshot of the queries used for this run
-      raw/
-        1_xai_llm.json              # raw SS fetch
-        2_mi_llm.json
-        ...
-      final/
-        1_xai_llm.json              # after ID-based deduplication
-        ...
-      final_title_deduped/
-        1_xai_llm.json              # after title-based deduplication
-        ...
-      final_recovered_abstract/
-        1_xai_llm.json              # after API-based abstract recovery
-        ...
-      publisher_scraped/
-        1_xai_llm.json              # after scrape-based abstract recovery
-        ...
-      reports/
-        acquisition_stats.json
-        title_dedup_stats.json
-        intra_title_duplicates.csv
-        inter_title_duplicates.csv
-      seer_ingest/
-        manifest.json
-        papers.json
-    20260615-093000/                # earlier run, unaffected
-      ...
-```
-
-Each stage reads from the previous stage's directory and writes to its own. The `run.json` file is written at the start of each run (status: `running`) and updated on completion (status: `complete`).
-
-**`run.json` schema:**
-
-```json
-{
-  "run_id": "20260628-142300_xai-sweep-june",
-  "label": "xai-sweep-june",
-  "started_at": "2026-06-28T14:23:00",
-  "completed_at": "2026-06-28T15:47:00",
-  "status": "complete",
-  "search_queries_file": "/original/path/search_queries.json",
-  "stages": { "api_recovery": true, "scrape_recovery": false },
-  "counts": {
-    "1_xai_llm": { "raw": 4821, "final": 2103 },
-    "2_mi_llm":  { "raw": 1240, "final": 891 }
-  }
-}
-```
-
----
-
-## SEER Ingest Bundle
-
-Every pipeline run automatically produces a **SEER ingest bundle** — a self-describing,
-schema-versioned directory that the SEER Django application can import directly.  The
-bundle is the single coupling point between this library (the producer) and SEER (the
-consumer); neither side reaches into the other's internal data structures.
-
-The frozen interface specification lives in `00_CONTRACT.md` in this repository.
-
-### Bundle Layout
-
-```
-<bundle_dir>/
-    manifest.json      # run-level metadata (the "run snapshot")
-    papers.json        # flat JSON array of paper records
-```
-
-The default location for a keyword-search run is:
-
-```
-<base_dir>/runs/<run_id>/seer_ingest/
-```
-
-### manifest.json Fields
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `schema_version` | string | always | `"1.0"` — SEER rejects mismatches |
-| `pipeline` | string | always | constant `"paper_metadata"` |
-| `library_version` | string | always | git SHA or package version |
-| `generated_at` | string | always | ISO-8601 UTC timestamp |
-| `run_type` | string | always | `keyword_search` \| `by_id` \| `citation_graph` |
-| `source_label` | string\|null | optional | human label passed via `--label` |
-| `fetch_params` | object | always | date filters + citation thresholds |
-| `queries` | object | `keyword_search` | category key → SS query string |
-| `seeds` | array | `citation_graph` | list of `{seed_paper_id, edges}` |
-| `counts` | object | always | `total_unique_papers`, `per_query`, `identity_dropped` |
-| `papers_file` | string | always | `"papers.json"` |
-
-`fetch_params` shape for `keyword_search`: per-query SS API params keyed by query ID:
-
-```json
-{
-  "1_xai_llm": { "publicationDateOrYear": "2020-01-01:", "publicationTypes": "JournalArticle,Conference" },
-  "2_saes_llm": { "publicationDateOrYear": "2020-01-01:", "minCitationCount": 5 }
-}
-```
-
-### papers.json Record Shape
-
-Each element is a standard Semantic Scholar metadata record plus a `_provenance` object:
-
-```jsonc
-{
-  "paperId": "649def34f8be52c8b66281af98ae884c09aef38b",
-  "externalIds": { "DOI": "10.1016/...", "ArXiv": "2410.20513" },
-  "title": "…",
-  "abstract": "…",
-  "authors": [{ "authorId": "…", "name": "…" }],
-  "year": 2023,
-  "publicationDate": "2023-05-04",
-  "venue": "…",
-  "citationCount": 42,
-  "isOpenAccess": true,
-  "openAccessPdf": { "url": "https://…pdf" },
-
-  "_provenance": {
-    "matched_queries": ["1_xai_llm", "3_activation_weight_llm"],
-    "seed_paper_id": null,
-    "edge_type": null,
-    "is_influential": null,
-    "input_id": null,
-    "fetch_status": null
-  }
-}
-```
-
-`_provenance` per run type:
-
-| Field | `keyword_search` | `by_id` | `citation_graph` |
-|---|---|---|---|
-| `matched_queries` | non-empty list of query keys | `[]` | `[]` |
-| `seed_paper_id` | null | null | SS paper ID of the seed |
-| `edge_type` | null | null | `"citation"` or `"reference"` |
-| `is_influential` | null | null | bool |
-| `input_id` | null | original caller string | null |
-| `fetch_status` | null | `"found"` \| `"not_found"` \| `"invalid_id"` | null |
-
-### _provenance Rules
-
-1. **Always present.** Every record has `_provenance` with all six keys (unused ones are `null` / `[]`).
-2. **`keyword_search`**: `matched_queries` is non-empty. Every key is present in `manifest.queries`. It includes the category that owns the paper *and* every other query whose result set contained the same paper before deduplication — intra-run multi-query membership is fully captured here.
-3. **`citation_graph`**: `seed_paper_id` non-null, `edge_type` ∈ `{"citation","reference"}`, `is_influential` is a bool. A paper appearing under multiple seeds yields multiple records; SEER deduplicates and keeps both edges.
-4. **`by_id`**: `input_id` non-null, `fetch_status` ∈ `{"found","not_found","invalid_id"}`. Records with `fetch_status != "found"` are included so SEER can log them.
-5. **Identity guarantee.** Every `found` record has at least one of `paperId`, `externalIds.DOI`, or `externalIds.ArXiv`. Records that fail this check are dropped and counted in `manifest.counts.identity_dropped`.
-
-**Division of labour:** the producer (this library) guarantees intra-run multi-query
-membership in `matched_queries`.  Cross-run accumulation (the same paper re-found by a
-later run) and `was_new_at_ingest` tracking are SEER's responsibility.
-
-### Producing a Bundle (CLI)
-
-```bash
-# Preview result counts — one lightweight request per query, no data fetched
-python -m paper_metadata.export preview \
-  --search-queries-path paper_metadata/search_queries.json
-
-# Keyword sweep — bundle lands in <base_dir>/runs/<run_id>/seer_ingest/
-python -m paper_metadata.export keyword \
-  --base-dir /data/myproject \
-  --label "xai-sweep-2026-07"
-
-# Skip abstract recovery for a faster test run
-python -m paper_metadata.export keyword \
-  --base-dir /data/myproject \
-  --no-recovery
-
-# List past runs
-python -m paper_metadata.export list-runs --base-dir /data/myproject
-
-# Explicit paper ID list
-python -m paper_metadata.export by-id \
-  --ids paper_ids.json \
-  --bundle-dir /data/bundles/manual-batch-1 \
-  --label "manual seed set"
-
-# Snowball from seed papers (fetch both citations and references)
-python -m paper_metadata.export citation \
-  --ids seeds.json \
-  --bundle-dir /data/bundles/snowball-r1 \
-  --citations --references \
-  --label "snowball round 1"
-```
-
-`--ids` accepts either a JSON file containing a list of ID strings, or a
-comma-separated list of IDs directly on the command line.
-
-When neither `--citations` nor `--references` is specified for the `citation`
-subcommand, both are fetched by default.
-
-### Producing a Bundle (Python)
-
-```python
-from paper_data import export_keyword_bundle, export_by_id_bundle, export_citation_bundle
-
-# Keyword sweep — run lands in <base_dir>/runs/<run_id>/seer_ingest/
-bundle_dir = export_keyword_bundle(
-    base_dir="/data/myproject",
-    source_label="XAI/LLM sweep 2026-07",
-    label="xai-sweep-2026-07",         # appended to run directory name
-)
-
-# Explicit IDs
-bundle_dir = export_by_id_bundle(
-    ["2106.15928", "DOI:10.18653/v1/N18-3011"],
-    bundle_dir="/data/bundles/manual-1",
-    source_label="manual seed set",
-)
-
-# Citation graph
-bundle_dir = export_citation_bundle(
-    ["649def34f8be52c8b66281af98ae884c09aef38b"],
-    bundle_dir="/data/bundles/snowball-r1",
-    citations=True,
-    references=True,
-    source_label="snowball round 1",
-)
-```
-
-All three functions re-run the relevant fetch (they do not read from existing output
-files). If you have already run `fetch_metadata()`, the keyword bundle will have been
-written automatically to `<base_dir>/runs/<run_id>/seer_ingest/`.
-
----
-
-## Input Formats (paper_downloader)
-
-The pipeline accepts several input formats, all passed via the `--input` argument.
-
-**A JSON file containing a list of Semantic Scholar metadata records**
-
-This is the recommended format if you are working with data exported from Semantic Scholar. You can just input papers metadata json file, based on the semantic scholar paperID it will download the papers and in the end new json file is given with download stats (file path, downloaded status etc).
-
-**A JSON file containing a list of identifier strings**
-
-A plain list of identifiers. Each string can be a Semantic Scholar paper ID. Although it works with arxivID but paperID is safe.
-
-**A single identifier string passed directly**
-
-```bash
-python main.py --input "004e5d24c1e8511519fc081b6d723c55651f80b9"
-python main.py --input "10.1016/j.websem.2024.100822"
-python main.py --input "2410.20513"
-```
-
----
-
-## Running the Download Pipeline
-
-Basic usage (config file is default):
-
-```bash
-python main.py --input your_papers.json
-```
-
-With an explicit config file (if custom config file is used):
-
-```bash
-python main.py --input your_papers.json --config config.json
-```
-
-With enriched output — writes a copy of your input JSON with `pdf_path`, `download_status`, and `downloaded` fields added to each record:
-
-```bash
-python main.py --input your_papers.json --output your_papers_enriched.json
-```
-
-If `--output` is not provided, the enriched file is written automatically as `your_papers_enriched.json` in the same directory as the input file.
-
-With a custom stats output directory and a label to identify this run:
-
-```bash
-python main.py --input your_papers.json --stats-dir /path/to/stats --run-label batch_01
-```
-
-With logging to a file: set `"log_file": "pipeline.log"` in the `logging` section of `config.json`.
-
----
-
-## Output Structure (paper_downloader)
-
-After a run, the following directory structure is created under the configured `root_dir` (default `data/`):
-
-```
-data/
-  pdfs/
-    arxiv__2410.20513.pdf
-    doi__10.1016_j.websem.2024.100822.pdf
-    ...
-  metadata/
-    arxiv__2410.20513.json
-    ...
-  manifests/
-    arxiv__2410.20513.json
-    ...
-  download_stats/
-    download_stats_20260328T230509Z_full.json
-    download_stats_20260328T230509Z_short.json
-    download_stats_20260328T230509Z_short.csv
-```
-
-**PDFs** are named by the paper key derived from the best available identifier. The key format is `doi__...`, `arxiv__...`, `ss__...`, or `corpus__...`.
-
-**Metadata** files are JSON snapshots of the paper record as it was known at the time of processing, including all recovered identifiers.
-
-**Manifests** are per-paper JSON files that record the full processing history: every pipeline stage, its status, timestamps, retry count, and the source that was selected and downloaded. If a run is interrupted, manifests allow the pipeline to resume correctly on the next run without re-downloading files that already exist.
-
-**Stats files** are written after every run. Three files are produced per run with a UTC timestamp in the filename so no run overwrites a previous one:
-
-- `_full.json` — complete result for every paper including all provider attempts, download attempts, selected source, and error details.
-- `_short.json` — compact version with one row per paper: paper ID, title, downloaded (true/false), status, and pdf_path.
-- `_short.csv` — same compact data in CSV format for spreadsheet use.
-
-**Enriched input file** — if `--output` is specified or auto-derived, a copy of your input JSON is written with three fields added to each paper record:
-
-- `pdf_path` — absolute path to the downloaded PDF, or null if the download failed.
-- `download_status` — one of `downloaded`, `already_exists`, `failed_unresolved_no_legal_pdf`, `failed_download_failed_all_candidates`, or similar.
-- `downloaded` — boolean, true if a PDF is available on disk.
-
----
-
-## Source Providers
-
-The pipeline queries up to 11 open-access source providers in priority order. Providers are tried sequentially. All candidates from all providers are collected, scored, and ranked before the best one is selected for download.
-
-| Provider | What it does | API key required |
-|---|---|---|
-| metadata_open_access | Reads the `openAccessPdf` URL directly from Semantic Scholar metadata | No |
-| arxiv | Constructs the PDF URL from the ArXiv ID; without one, searches the arXiv API by title and accepts a hit only when the authors also match | No |
-| acl | Constructs the PDF URL from the ACL Anthology ID or ACL DOI | No |
-| cvf | Constructs the PDF URL from the CVF (CVPR/ICCV/ECCV) paper title | No |
-| openalex | Looks up open-access locations via the OpenAlex API | Optional |
-| unpaywall | Looks up open-access locations via the Unpaywall API | Email required |
-| europepmc | Searches EuropePMC for papers whose full text is in EPMC with a PDF (author manuscripts included) | No |
-| crossref | Extracts PDF links from Crossref work metadata | Optional (email) |
-| core | Searches CORE for repository copies | Key required |
-| zenodo | Searches Zenodo for deposited copies | No |
-| doaj | Searches the Directory of Open Access Journals | No |
-| broad_search | Falls back to DuckDuckGo site-scoped search as a last resort | No |
-
-### Scoring System
-
-The scoring system prefers publisher versions over accepted manuscripts over preprints. Within each version type, candidates from trusted domains are ranked above unknown domains. A paper is considered downloaded if any candidate succeeds. If all candidates fail, the paper is marked as `failed_unresolved_no_legal_pdf` and appears in the failed count in the stats summary.
-
-When multiple providers return PDF candidates for the same paper, the pipeline ranks them using a two-layer system before attempting any download. The first layer is a hard categorical sort: candidates are ordered by whether they are a publisher version, whether the URL is a direct `.pdf` link, and whether the hosting server is a known publisher domain — in that priority order, evaluated as a tuple so a confirmed publisher version always outranks a preprint regardless of score. The second layer is a continuous quality score built from six independent additive signals: a direct PDF link adds `+0.20`, a domain matching the `trusted_domains` config list adds `+0.20`, a publisher version type adds `+0.30` (or `+0.15` if `prefer_publisher_version` is false) while an accepted version adds `+0.20`, a preprint adds `+0.10` if allowed or `-1.00` if `allow_preprints` is false effectively eliminating it, a publisher host type adds `+0.10` and a repository host `+0.05`, a title similarity score at or above `title_similarity_threshold` adds `+0.10` while a score below threshold adds `-0.20`, and finally the provider's own base confidence — ranging from `0.62` for BroadSearch up to `0.97` for ACL Anthology — contributes at most `+0.10` (scaled by a factor of `0.10`) so that the pipeline's own structural signals always outweigh any single provider's self-reported certainty. Before ranking, duplicate URLs across providers are collapsed keeping only the higher-scored entry. The top-ranked candidate is attempted first; if it fails to download, the pipeline falls through the ranked list automatically. Every candidate's full score breakdown is persisted in the paper's manifest JSON under `stats.resolution.all_candidates` for inspection.
-
----
-
-## Resume and Idempotency
-
-The pipeline is safe to re-run on the same input. On each run:
-
-- Papers whose PDF already exists on disk and whose manifest shows a completed download stage are skipped. The log will say `pdf already exists, skipping download`.
-- Papers that previously failed are retried from the failed stage.
-- Stats files use timestamps in their names so each run produces new files without overwriting previous results.
-
-To force a full re-download of everything, delete the `data/` directory before running.
-
----
-
-## Programmatic Usage (paper_downloader)
-
-The pipeline can be used as a callable library without the CLI. This is useful when integrating the downloader into a larger pipeline or calling it from another script.
-
-### Installation
-
-From the project root, install in editable mode once:
-
-```bash
-pip install -e .
-```
-
-After this, `paper_data.py` is importable from any folder without path manipulation.
-
-### Basic Usage
-
-```python
-from paper_data import download
-
-results = download("649def34f8be52c8b66281af98ae884c09aef38b")
-
-results = download([
     "649def34f8be52c8b66281af98ae884c09aef38b",
-])
-
-for r in results:
-    if r.downloaded:
-        print(r.pdf_path)
-    else:
-        print(r.status, r.error)
+    citations=True, references=True, influential_only=True, max_results=200,
+    save_dir="/data/snowball",
+)
 ```
 
-### Walking a list one paper at a time
+Identifiers are auto-detected: 40-character hex is a Semantic Scholar id, `10.…` a DOI,
+`2106.15928` or `cs/0612033` an arXiv id, a URL a URL. Explicit prefixes (`DOI:`, `ARXIV:`,
+`CorpusId:`, `PMID:`, `PMCID:`, `MAG:`, `ACL:`) also work. **Bare numbers are rejected** —
+they are ambiguous across corpus, PubMed and MAG ids, so write `CorpusId:12345678`.
 
-`download()` builds a fresh orchestrator per call — twelve provider HTTP sessions, a Semantic Scholar client, and a re-read of `config.json`. That is wasted work if you are looping over papers to record progress after each one. Open the downloader once instead:
+`fetch_papers_by_id` returns one record per input with `_input_id` and `_fetch_status`
+(`found` / `not_found` / `invalid_id`). `fetch_citations_and_references` returns one
+`PaperGraphResult` per seed; the API silently truncates at about 9,999 edges per endpoint, and
+`citations_truncated` / `references_truncated` tell you when that happened. For per-endpoint
+control pass `citation_options` / `reference_options`; mixing those with the shorthand
+keywords raises rather than silently ignoring one of them.
 
-```python
-from paper_data import open_downloader
+---
 
-with open_downloader(config=cfg) as dl:
-    for paper_id in ids:
-        result = dl.download_one(paper_id)
-        record(result)          # your own progress reporting
-```
+## Configuration reference
 
-The handle is **not** thread-safe: the providers hold `requests.Session` objects, which must not be shared across threads. For parallelism, open one handle per thread — the sessions are ones that thread needed anyway.
+`config.json` next to `main.py` controls the downloader. Pass another with `--config`.
+
+| Field | What it controls |
+|---|---|
+| `resolution.source_priority` | Which providers run, in what order. Both the enable list and the order |
+| `resolution.stop_when_confident` / `stop_confidence_threshold` | The early stop described in [How a paper is resolved](#how-a-paper-is-resolved) |
+| `resolution.prefer_publisher_version` / `allow_preprints` | Ranking preferences. `prefer_publisher_version` also narrows what may end the provider search |
+| `resolution.title_similarity_threshold` | How close a title match must be for a title-based lookup to count. Default 0.90 |
+| `resolution.trusted_domains` | Hosts worth `+0.20` in scoring, and the only ones that may end the search early |
+| `download.max_retries` / `retry_backoff_seconds` | Retries per URL, with exponential backoff — applied only to failures that could go the other way: connection errors, timeouts, 429, 5xx. A 401/403/404 is an answer, not a glitch, and is never retried |
+| `download.landing_page_fallback` / `landing_page_max_bytes` | The one-hop landing-page follow, and how much of such a page to read |
+| `download.denied_hosts` | Hosts never to contact, by dotted suffix (`acm.org` covers `dl.acm.org`). Their candidates are kept but tried last and failed without a request, so those papers stay *retryable* rather than being recorded as having no copy |
+| `download.min_pdf_bytes` / `max_pdf_bytes` / `allowed_content_types` | What counts as a PDF |
+| `output.root_dir` | Where everything is written. **Set this to an absolute path** if your process's working directory is not fixed |
+| `resume.*` | Stage skipping and existing-file verification |
+
+`paper_metadata/config.json` controls the other pipeline. The three fields worth setting:
+`output.base_dir` (where `runs/` goes), `search_queries_path`, and
+`semantic_scholar.fields` (which metadata columns to request).
 
 ---
 
 ## Troubleshooting
 
-**The pipeline reports a paper as `failed_unresolved_no_legal_pdf`**
+**Everything is `not_free` / `unresolved_no_legal_pdf`.** All providers returned nothing. Most
+often the corpus really is closed access — IEEE conference papers and Springer chapters
+usually have no free copy anywhere. Check `provider_attempts` on a few results: each provider
+records *why* it returned nothing, which distinguishes "Unpaywall has never heard of this DOI"
+from "Unpaywall is switched off because no email is configured".
 
-This means all 11 providers returned no downloadable PDF for that paper. Common reasons: the paper is closed access with no preprint (IEEE, ACM, Elsevier without OA), or it is too recent to have been indexed by repositories. The pipeline does not attempt to bypass paywalls and will not download content that is not legally open access.
+**Every paper takes about the same suspiciously long time.** That is the signature of a host
+you cannot reach, since a blocked host costs a full `connect_timeout_seconds` rather than
+failing fast. `broad_search` is the usual culprit: eight DuckDuckGo queries per paper, and if
+DuckDuckGo is blocked on your network that is eight timeouts per paper for nothing. Drop it
+from `source_priority`.
 
-**The pipeline is slow**
+**Papers are recorded as blocked, from a specific publisher.** Check
+`host_gate.blocked_hosts()` or the `host_refusals.json` file. If the reason mentions a bot
+challenge, no amount of waiting or retrying will help — see [Bot
+walls](#bot-walls-and-why-another-machine-does-not-help). If it mentions a rate-shaped
+refusal, the cool-off will clear it.
 
-The pipeline processes papers sequentially, and each paper queries external APIs in sequence, so runtime is dominated by network latency and by any rate-limiting backoff.
+**The PDF path in the result does not exist.** `output.root_dir` defaults to the relative path
+`data`, so an unconfigured run writes to `<cwd>/data/pdfs/` and returns a path relative to
+whatever the working directory was. Set it to an absolute path.
 
-Check the obvious culprit first: **is every paper taking about the same suspiciously long time?** That is the signature of a provider whose host you cannot reach, since a blocked host costs a full `connect_timeout_seconds` rather than failing fast. `broad_search` is the usual one — it makes eight DuckDuckGo queries per paper, and if DuckDuckGo is blocked on your network that is eight connect timeouts, every paper, contributing nothing. Drop it from `resolution.source_priority`.
+**Keys are not being picked up.** The `.env` must be in the directory you run from (both
+loaders also search upwards). Shell environment variables win over `.env` values. Names must
+match exactly — see [Keys](#keys-and-what-each-one-buys).
 
-Otherwise: provide API keys (Semantic Scholar and CORE especially) to reduce rate-limiting delays, keep `resolution.stop_when_confident` on, and note that papers with ArXiv IDs resolve in one or two provider calls and are fast.
+**`config.json` not found.** It is looked for next to `main.py`. Pass `--config
+/absolute/path/config.json` when running from elsewhere.
 
-**Import errors after installation**
+**Import errors after installing.** Python 3.10 or newer, and `pip install -e .` in the same
+environment you run from.
 
-Ensure you are running Python 3.10 or higher and that you installed dependencies with `pip install -r requirements.txt` in the same environment. Check that your working directory is the repository root when running `python main.py`, so that the `app/` package is on the Python path.
+---
 
-**Config file not found**
+## Using this from SEER
 
-The pipeline looks for `config.json` next to `main.py` by default. If you run `main.py` from a different directory, pass the config path explicitly with `--config /path/to/config.json`.
+SEER is the systematic-review application this library was built for.
+It uses both pipelines: `paper_metadata` produces the corpus SEER ingests, and
+`paper_downloader` fetches the PDFs that SEER's full-text extraction then reads.
 
-**API keys not being picked up**
+The coupling is deliberately narrow. SEER imports `paper_data` and nothing below it, and this
+library knows nothing about SEER at all.
 
-Ensure your `.env` file is in the same directory as `main.py` and that the variable names exactly match those listed in the API Keys section above. Environment variables set in the shell take precedence over `.env` file values.
+### Metadata: the ingest bundle
 
-**paper_metadata: search_queries.json or base_dir not found**
+Every metadata run writes a **SEER ingest bundle** — a self-describing, schema-versioned
+directory SEER imports directly. The frozen interface specification is `00_CONTRACT.md` in
+this repository.
 
-Set the `search_queries_path` field or `base_dir` in `config.json` to the absolute path of your `search_queries.json` file, or pass both explicitly on the command line:
-
-```bash
-python -m paper_metadata.main \
-  --base-dir /your/output/path \
-  --search-queries-path /path/to/search_queries.json
 ```
+<bundle_dir>/
+    manifest.json      # the run snapshot
+    papers.json        # a flat array of paper records
+```
+
+For a keyword run it lands at `<base_dir>/runs/<run_id>/seer_ingest/`.
+
+`manifest.json` carries `schema_version` (`"1.0"`; SEER rejects a mismatch), `pipeline`,
+`library_version`, `generated_at`, `run_type` (`keyword_search` | `by_id` | `citation_graph`),
+an optional `source_label`, `fetch_params`, `counts` (`total_unique_papers`, `per_query`,
+`identity_dropped`), and `papers_file`. Keyword runs also carry `queries`; citation runs carry
+`seeds`.
+
+Each record in `papers.json` is a standard Semantic Scholar record plus a `_provenance`
+object with all six keys always present:
+
+| Field | `keyword_search` | `by_id` | `citation_graph` |
+|---|---|---|---|
+| `matched_queries` | every query whose results contained this paper, before deduplication | `[]` | `[]` |
+| `seed_paper_id` | null | null | the seed's Semantic Scholar id |
+| `edge_type` | null | null | `citation` or `reference` |
+| `is_influential` | null | null | bool |
+| `input_id` | null | the caller's original string | null |
+| `fetch_status` | null | `found` / `not_found` / `invalid_id` | null |
+
+Two guarantees the producer makes. **Identity**: every `found` record has at least one of
+`paperId`, `externalIds.DOI` or `externalIds.ArXiv`; records failing that are dropped and
+counted in `manifest.counts.identity_dropped`. **Intra-run multi-query membership**:
+`matched_queries` is complete for this run. Cross-run accumulation — the same paper re-found
+by a later run — is SEER's job, not this library's.
+
+Produce one with `export_keyword_bundle()`, `export_by_id_bundle()` or
+`export_citation_bundle()`, or the `keyword` / `by-id` / `citation` subcommands of
+`python -m paper_metadata.export`.
+
+### PDFs: what SEER configures and what it stores
+
+SEER calls `open_downloader()` once per worker thread and `download_one()` per paper, passing
+the paper's stored Semantic Scholar record rather than a bare identifier — which is what lets
+it skip the metadata lookup described in [Downloading PDFs](#downloading-pdfs).
+
+It overrides three things in the config it passes:
+
+- **`output.root_dir`** — pinned to an absolute path under SEER's media root, so the returned
+  `pdf_path` and SEER's own lookup agree regardless of the process's working directory.
+- **`resolution.source_priority`** — filtered by SEER's `PDF_DISABLED_SOURCES`. Its default
+  drops `broad_search`, because DuckDuckGo is unreachable from that network.
+- **`download.denied_hosts`** — set from SEER's `PDF_DENIED_HOSTS`, four publishers measured
+  to refuse this client on the first request from any address.
+
+Keys reach the library the ordinary way: SEER reads them from its own settings and puts them
+in the process environment under the names in [Keys](#keys-and-what-each-one-buys).
+
+SEER stores the outcome of each attempt as a status it can act on, and the mapping is the
+reason several of the distinctions above exist at all:
+
+| What the library reports | What SEER stores | Retried? |
+|---|---|---|
+| `record_class` is terminal (`skipped_*`) | `no_full_text` | **Never**, not even by "retry previously failed" |
+| `failure_reason: client_challenged` | `client_challenged` | Yes — a re-run after a key is configured takes a different route |
+| `oa_asserted_by` non-empty, and a host refused us | `open_access_unfetchable` | Yes |
+| A host refused or was deny-listed | `transient_error`, with a detail saying which | Yes |
+| `failure_reason: not_yet_available` | `transient_error`, "try again in a few weeks" | Yes |
+| `failure_reason: withdrawn` | `no_full_text` | Never |
+| 401/403 on the article itself | `blocked_by_publisher` | Only on request |
+| Everything else settled | `no_open_access` / `landing_page_no_pdf` | Only on request |
+
+The rule underneath that table: **nothing that is really a fact about our server may be stored
+as a verdict on a paper.** A bot wall, a rate ban and a deny-list entry all produce "no PDF",
+and recording any of them as `blocked_by_publisher` — which SEER treats as settled — would
+turn our own situation into a permanent judgement about someone's article. Conversely,
+`no_full_text` is the one status that must never be retried, because the record is not a
+document and no run will make it one.
+
+SEER's side of this lives in `papers/enrichment_service.py` and is documented in its
+`docs/subsystems/fulltext-pipeline.md`.

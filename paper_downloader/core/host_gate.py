@@ -35,6 +35,17 @@ Two more things the gate knows that are not about rate:
   48 h). A ban is a fact about this host and this client, so a fresh worker process should
   not have to earn it again -- but it is still never a verdict on a paper.
 
+**A bot challenge is not a refusal, and the two want opposite treatment.** Measured from two
+countries, two institutions and two providers: Cloudflare, MDPI, IEEE, Imperva and Radware
+all turn this client away on its *first* request, whatever the address and whatever the
+User-Agent, because it is not a browser. Feeding that into the escalating cool-off is wrong
+twice over -- it waits out a rate limit that was never there, and it climbs to a 48-hour
+block for something no amount of waiting will change. So challenges are tracked separately
+(``note_challenge``): one fixed cool-off, no ladder, not persisted, and a distinct reason so
+the caller can report "a bot wall stopped a non-browser client" rather than "the host is
+rate-limiting us". Only rate- or IP-shaped denials -- 429, ``Retry-After``, a refusal that
+clears from another address -- climb the ladder.
+
 **Rate state is in-process.** The rate limiter is module-level, so it bounds one Python
 process. SEER runs a single ``db_worker``, which is what makes that sufficient. Several
 ``db_worker`` processes would each get their own gate and the effective rate would
@@ -99,6 +110,17 @@ _POLICIES: dict[str, HostPolicy] = {
     "ebi.ac.uk": HostPolicy(concurrency=1, min_interval=0.34),
     "ncbi.nlm.nih.gov": HostPolicy(concurrency=1, min_interval=0.34),  # NCBI asks for <=3/s
 
+    # Publisher text-and-data-mining APIs. Wiley publishes two limits, 3 per second and 60
+    # per 10 minutes, and the second is the binding one: 10 seconds between requests is what
+    # 60 per 10 minutes means. The default one-per-second would have exceeded it tenfold and
+    # spent the deployment's entitlement on 429s.
+    "api.wiley.com": HostPolicy(concurrency=1, min_interval=10.0),
+    # Elsevier asks for a "reasonable and customary" rate rather than a number.
+    "api.elsevier.com": HostPolicy(concurrency=1, min_interval=1.0),
+    # OpenAlex's full-text cache. Metered rather than rate-limited, and the money is the
+    # real brake -- but it is one host serving many deployments, so no faster than the API.
+    "content.openalex.org": HostPolicy(concurrency=1, min_interval=0.5),
+
     # Observed refusing this deployment's IP outright in the September 2026 production run
     # -- the whole site, not just the PDF URLs. Kept in the table so that once the bans age
     # out we do not immediately earn them back.
@@ -146,9 +168,13 @@ _REFUSAL_MARKERS = (
     b"enable javascript and cookies to continue",
 )
 
-#: The subset of `_REFUSAL_MARKERS` that is unambiguous anti-bot machinery, used when the
-#: status was 200 and so carries no signal of its own. "Access denied" is left out: at 200
-#: it could plausibly be the text of a paper about access control.
+#: Unambiguous anti-bot machinery, scanned whatever the status -- at 200 the status carries
+#: no signal at all, and at 403 the body is the only thing that separates "this client is not
+#: a browser" from "you are not subscribed to this article".
+#:
+#: Every entry is boilerplate emitted by a bot-management product, never prose a paper could
+#: contain. "Access denied" is deliberately absent for that reason, and so is a bare
+#: "captcha" -- there are papers about CAPTCHAs.
 _CHALLENGE_MARKERS = (
     b"attention required",
     b"cf-browser-verification",
@@ -157,7 +183,68 @@ _CHALLENGE_MARKERS = (
     b"request unsuccessful. incapsula",
     b"you have been blocked",
     b"enable javascript and cookies to continue",
+    b"checking your browser before accessing",
+    b"/cdn-cgi/challenge-platform",
+    # Imperva Incapsula. The interstitial is a 212-byte page whose whole job is to load this
+    # resource; it never mentions a wall, which is why it used to be filed as "file too small".
+    b"_incapsula_resource",
+    # Radware Bot Manager, which IOP redirects to.
+    b"validate.perfdrive.com",
+    b"radware bot manager",
+    # PerimeterX.
+    b"px-captcha",
+    b"/_px/",
 )
+
+#: Response headers that name the bot-management product outright. A Cloudflare challenge
+#: sets ``Cf-Mitigated: challenge`` whatever the body looks like, which catches the ones too
+#: large or too obfuscated for a marker scan.
+_CHALLENGE_HEADERS: tuple[tuple[str, str], ...] = (
+    ("cf-mitigated", "challenge"),
+    ("x-datadome", "protected"),
+)
+
+#: Hosts measured to answer a non-browser client with a bot check rather than an answer about
+#: the article -- observed identically from Karlsruhe and from Oslo, on different networks and
+#: in different countries, in September 2026. A denial from one of these is a challenge, not a
+#: rate limit, even when the page carries no recognisable marker: Elsevier's is an 800 KB HTML
+#: document titled "ScienceDirect" with no boilerplate any scanner would catch.
+#:
+#: This is a claim about the host's policy towards scripts, not about any paper on it, and not
+#: about this deployment's address. Matched by dotted suffix, like `_POLICIES`.
+_CHALLENGE_HOSTS: frozenset[str] = frozenset({
+    "sciencedirect.com",
+    "linkinghub.elsevier.com",
+    "mdpi.com",
+    "ieeexplore.ieee.org",
+    "iopscience.iop.org",
+})
+
+#: Hosts whose 4xx is an answer about *one article*, not a denial of this client.
+#:
+#: Publisher APIs answer "you are not entitled to this article" with a small 403, which is
+#: byte-for-byte the shape of an edge denial. Reading it as one would block the API for every
+#: later paper in the batch -- so one unentitled article would cost every entitled one. These
+#: hosts are therefore never blocked on a status alone; a real bot wall on them would still be
+#: caught, because that is recognised from markers and headers rather than from size.
+_API_HOSTS: frozenset[str] = frozenset({
+    "api.wiley.com",
+    "api.elsevier.com",
+    "content.openalex.org",
+    "api.openalex.org",
+    "api.crossref.org",
+    "api.unpaywall.org",
+    "api.semanticscholar.org",
+    "api.core.ac.uk",
+    "www.ebi.ac.uk",
+    "ebi.ac.uk",
+})
+
+#: How long a challenged host is skipped. Flat, not a ladder: waiting longer cannot turn this
+#: client into a browser, and the only reason to block at all is to stop the rest of a batch
+#: paying for the same wall. Short enough that a configuration change (a new provider, a
+#: token) gets a fresh chance within the hour.
+CHALLENGE_COOLOFF_SECONDS = 3600.0
 
 _ONE_HOP_AT_A_TIME = threading.local()
 
@@ -228,16 +315,23 @@ def is_denied(url: str) -> bool:
 
 class _HostState:
     __slots__ = ("policy", "semaphore", "lock", "next_start", "blocked_until",
-                 "blocked_reason", "blocked_at")
+                 "blocked_reason", "blocked_at", "challenged_until", "challenge_reason",
+                 "challenged_at")
 
     def __init__(self, policy: HostPolicy) -> None:
         self.policy = policy
         self.semaphore = threading.BoundedSemaphore(max(1, policy.concurrency))
         self.lock = threading.Lock()
         self.next_start = 0.0
+        # A rate- or IP-shaped refusal: escalating cool-off, persisted across processes.
         self.blocked_until = 0.0
         self.blocked_reason = ""
         self.blocked_at = 0.0
+        # A bot wall: flat cool-off, in-process only. Kept apart so neither can be read as
+        # the other -- see the module docstring.
+        self.challenged_until = 0.0
+        self.challenge_reason = ""
+        self.challenged_at = 0.0
 
 
 _states: dict[str, _HostState] = {}
@@ -314,8 +408,55 @@ class GatedSession(requests.Session):
             return super().send(request, **kwargs)
 
 
-def looks_like_refusal(status_code: int, body: bytes) -> bool:
-    """Is this response the host refusing us, rather than answering about a paper?"""
+def is_challenge_host(url: str) -> bool:
+    """Is this URL on a host measured to bot-check every non-browser client?"""
+    host = host_key(url)
+    if not host:
+        return False
+    labels = host.split(".")
+    return any(".".join(labels[start:]) in _CHALLENGE_HOSTS for start in range(len(labels)))
+
+
+def looks_like_challenge(body: bytes | str | None, *, headers=None) -> bool:
+    """Is this response a bot wall rather than an answer about a paper?
+
+    Checked before every refusal test, because the two are not the same thing and the answer
+    changes what a caller should do next. Headers are checked first: a Cloudflare challenge
+    announces itself in one, and its body is often too large or too obfuscated to scan.
+    """
+    for name, expected in _CHALLENGE_HEADERS:
+        try:
+            value = str((headers or {}).get(name) or "").strip().lower()
+        except Exception:
+            value = ""
+        if value and expected in value:
+            return True
+
+    if body is None:
+        return False
+    raw = body.encode("utf-8", errors="replace") if isinstance(body, str) else body
+    lowered = raw[:65536].lower()
+    return any(marker in lowered for marker in _CHALLENGE_MARKERS)
+
+
+def is_api_host(url: str) -> bool:
+    """Is this an API whose 4xx is about the article rather than about us? See `_API_HOSTS`."""
+    host = host_key(url)
+    if not host:
+        return False
+    labels = host.split(".")
+    return any(".".join(labels[start:]) in _API_HOSTS for start in range(len(labels)))
+
+
+def looks_like_refusal(status_code: int, body: bytes, *, url: str = "") -> bool:
+    """Is this response the host turning this *address* away, rather than answering?
+
+    Deliberately narrower than it looks. A bot wall also produces a small 403 body, so
+    `looks_like_challenge` is asked first everywhere this is used, and what remains here is
+    the rate- or IP-shaped denial that a cool-off can actually clear.
+    """
+    if url and is_api_host(url):
+        return False
     if status_code not in _REFUSAL_CANDIDATE_STATUSES:
         return False
     if status_code == 429:
@@ -366,19 +507,63 @@ def _record_refusal(host: str, reason: str) -> tuple[bool, float]:
     return not already, cooloff
 
 
-def note_response(url: str, status_code: int, body: bytes) -> bool:
-    """Record one response and return True if this host is now blocked.
+def _record_challenge(host: str, reason: str) -> bool:
+    """Mark `host` as bot-walled for a flat cool-off. Returns True if this is new.
 
-    Called for every response the download path does not accept. One refusal is enough:
-    the cost of being wrong is that a few papers get recorded as retryable, and the cost of
-    being slow to notice is another ban.
+    Nothing here touches `_refusals`: a wall this client cannot pass is not evidence about
+    our request rate, and letting it climb the refusal ladder is how a first-request
+    challenge turned into a 48-hour self-block.
     """
-    if not looks_like_refusal(status_code, body):
-        return False
+    now_mono = time.monotonic()
+    state = _state(host)
+    with state.lock:
+        already = state.challenged_until > now_mono
+        state.challenged_until = max(state.challenged_until, now_mono + CHALLENGE_COOLOFF_SECONDS)
+        state.challenge_reason = reason
+        if not already:
+            state.challenged_at = now_mono
+    return not already
 
+
+def note_challenge(url: str, reason: str) -> bool:
+    """Record that this host bot-walled us. Always returns True, for use in a conditional."""
     host = host_key(url)
     if not host:
         return False
+    if _record_challenge(host, reason):
+        logger.warning(
+            "%s wants a browser (%s) -- skipping it for %.0f min. No address or delay changes "
+            "this; a publisher API or a human is the route.",
+            host, reason, CHALLENGE_COOLOFF_SECONDS / 60,
+        )
+    return True
+
+
+def note_response(url: str, status_code: int, body: bytes, *, headers=None) -> str | None:
+    """Classify one rejected response and remember it. Returns what it was, or None.
+
+    Returns ``"challenge"`` when a bot wall answered, ``"refusal"`` when the host turned this
+    address away, and None when the response says something about the paper instead. Called
+    for every response the download path does not accept.
+
+    One observation is enough for either. The cost of being wrong is that a few papers are
+    recorded as retryable; the cost of being slow to notice is another ban.
+    """
+    host = host_key(url)
+    if not host:
+        return None
+
+    if looks_like_challenge(body, headers=headers):
+        note_challenge(url, f"HTTP {status_code} bot-challenge page")
+        return "challenge"
+
+    # Hosts measured to bot-check every script, whose page carries no marker to find.
+    if status_code in _REFUSAL_CANDIDATE_STATUSES and is_challenge_host(url) and not is_api_host(url):
+        note_challenge(url, f"HTTP {status_code}; this host bot-checks every non-browser client")
+        return "challenge"
+
+    if not looks_like_refusal(status_code, body, url=url):
+        return None
 
     reason = f"HTTP {status_code} with a {len(body)}-byte refusal page"
     newly, cooloff = _record_refusal(host, reason)
@@ -387,31 +572,20 @@ def note_response(url: str, status_code: int, body: bytes) -> bool:
             "%s is refusing this server (%s) -- skipping it for %.0f min",
             host, reason, cooloff / 60,
         )
-    return True
+    return "refusal"
 
 
 def note_challenge_page(url: str, body: str) -> bool:
-    """Record a 200-status page that is really a bot challenge; return True if now blocked.
+    """Record a 200-status page that is really a bot challenge; return True if it was one.
 
     Cloudflare and Incapsula both serve their interstitials with a 200, so the status says
     nothing and only the boilerplate in the body gives it away. Called when a page we
     reached turned out to offer no PDF link -- the alternative reading of that page, and
     the one that used to win, is "this paper has no downloadable copy".
     """
-    lowered = (body or "")[:65536].lower().encode("utf-8", errors="replace")
-    if not any(marker in lowered for marker in _CHALLENGE_MARKERS):
+    if not looks_like_challenge(body):
         return False
-
-    host = host_key(url)
-    if not host:
-        return False
-
-    newly, cooloff = _record_refusal(host, "served a bot-challenge page instead of the document")
-    if newly:
-        logger.warning(
-            "%s served a bot challenge -- skipping it for %.0f min", host, cooloff / 60,
-        )
-    return True
+    return note_challenge(url, "served a bot-challenge page instead of the document")
 
 
 def note_retry_after(url: str, seconds: float) -> None:
@@ -425,8 +599,13 @@ def note_retry_after(url: str, seconds: float) -> None:
     logger.info("%s asked for %.0fs before the next request", host, seconds)
 
 
-def block_reason(url: str) -> str | None:
-    """Why this host is currently blocked, or None if it is not."""
+def block_state(url: str) -> tuple[str, str] | None:
+    """Why this host is currently skipped, as ``(kind, reason)``, or None.
+
+    ``kind`` is ``"challenge"`` (a bot wall; no address or delay helps) or ``"refusal"``
+    (this address was turned away; a cool-off might). A host can be both, and the challenge
+    wins, because it is the one that says what a caller should do instead.
+    """
     host = host_key(url)
     if not host:
         return None
@@ -434,18 +613,28 @@ def block_reason(url: str) -> str | None:
         state = _states.get(host)
     if state is None:
         return None
+    now = time.monotonic()
     with state.lock:
-        if state.blocked_until <= time.monotonic():
-            return None
-        return state.blocked_reason or "refused an earlier request"
+        if state.challenged_until > now:
+            return "challenge", state.challenge_reason or "answered an earlier request with a bot challenge"
+        if state.blocked_until > now:
+            return "refusal", state.blocked_reason or "refused an earlier request"
+    return None
+
+
+def block_reason(url: str) -> str | None:
+    """Why this host is currently skipped, or None if it is not. See `block_state`."""
+    found = block_state(url)
+    return found[1] if found else None
 
 
 def check_blocked(url: str) -> None:
-    """Raise `HostBlockedError` if this host is on the deny list or refused us recently.
+    """Raise `HostBlockedError` if this host is denied, bot-walled, or refusing this address.
 
-    The two messages are deliberately different. A denied host was never asked, so "is
-    refusing this server" would be a claim about the host that nobody observed; whoever
-    stores the detail must be able to tell the two apart.
+    The three messages are deliberately different, and so are the flags on the exception. A
+    denied host was never asked, so "is refusing this server" would be a claim nobody
+    observed; a bot wall is not about this server at all. Whoever stores the detail has to be
+    able to tell them apart, because only one of the three is worth waiting out.
     """
     host = host_key(url)
     if is_denied(url):
@@ -453,12 +642,19 @@ def check_blocked(url: str) -> None:
             f"{host} is on the configured deny list -- not attempting {url}",
             host=host, denied=True,
         )
-    reason = block_reason(url)
-    if reason is not None:
+    found = block_state(url)
+    if found is None:
+        return
+    kind, reason = found
+    if kind == "challenge":
         raise HostBlockedError(
-            f"{host} is refusing this server ({reason}) -- not attempting {url}",
-            host=host,
+            f"{host} bot-challenges this client ({reason}) -- not attempting {url}",
+            host=host, challenge=True,
         )
+    raise HostBlockedError(
+        f"{host} is refusing this server ({reason}) -- not attempting {url}",
+        host=host,
+    )
 
 
 def blocked_hosts(*, since: float | None = None) -> list[tuple[str, str]]:
@@ -473,6 +669,11 @@ def blocked_hosts(*, since: float | None = None) -> list[tuple[str, str]]:
     found = []
     for host, state in items:
         with state.lock:
+            if state.challenged_until > now and not (
+                since is not None and state.challenged_at < since
+            ):
+                found.append((host, f"bot challenge: {state.challenge_reason}"))
+                continue
             if state.blocked_until <= now:
                 continue
             if since is not None and state.blocked_at < since:
