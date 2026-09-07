@@ -224,6 +224,7 @@ class SemanticScholarClient:
             dblp_id=ids.get("dblp_id") or paper.dblp_id,
             acl_id=ids.get("acl_id") or paper.acl_id,
             pmid=ids.get("pmid") or paper.pmid,
+            pmcid=ids.get("pmcid") or paper.pmcid,
             corpus_id=ids.get("corpus_id") or paper.corpus_id,
         )
 

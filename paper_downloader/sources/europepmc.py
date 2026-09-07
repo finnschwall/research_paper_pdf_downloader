@@ -27,8 +27,13 @@ def _domain_from_url(url: str | None) -> str | None:
 
 @dataclass(slots=True)
 class EuropePMCSourceProvider:
-    """
-    Europe PMC REST API
+    """Europe PMC REST API.
+
+    A record is usable when the full text is *in* Europe PMC with a PDF (`inEPMC` and
+    `hasPDF`), not when it is flagged open access. `isOpenAccess` is the licence subset:
+    author manuscripts deposited under a funder mandate are `isOpenAccess N` yet served
+    freely at the render URL. Gating on the flag dropped exactly those -- a measured
+    3.2 MB PDF reported as "no candidates".
     """
 
     download_config: DownloadConfig
@@ -36,6 +41,9 @@ class EuropePMCSourceProvider:
     base_url: str = "https://www.ebi.ac.uk/europepmc/webservices/rest"
     name: str = "europepmc"
     _session: requests.Session = field(default=None, init=False, repr=False)  # type: ignore[assignment]
+    last_reason: str | None = field(default=None, init=False, repr=False)
+    last_failed: bool = field(default=False, init=False, repr=False)
+    _records_seen: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._session = host_gate.GatedSession()
@@ -46,7 +54,10 @@ class EuropePMCSourceProvider:
             self._session.close()
 
     def resolve(self, paper: PaperRecord) -> list[SourceCandidate]:
+        self.last_reason = None
+        self.last_failed = False
         candidates: list[SourceCandidate] = []
+        self._records_seen = 0
 
         if paper.pmcid:
             results = self._search(f"PMCID:PMC{paper.pmcid}")
@@ -81,6 +92,11 @@ class EuropePMCSourceProvider:
                     )
                 )
 
+        if not candidates and self.last_reason is None:
+            self.last_reason = (
+                f"{self._records_seen} matching record(s), none in Europe PMC with a PDF"
+                if self._records_seen else "no matching record"
+            )
         return self._deduplicate(candidates)
 
     def _headers(self) -> dict[str, str]:
@@ -118,23 +134,30 @@ class EuropePMCSourceProvider:
                 allow_redirects=True,
                 verify=self.download_config.verify_ssl,
             )
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            self.last_failed = True
+            self.last_reason = f"request failed: {exc.__class__.__name__}"
             return []
 
         if response.status_code >= 400:
+            self.last_failed = True
+            self.last_reason = f"http {response.status_code}"
             return []
 
         try:
             payload = response.json()
         except ValueError:
+            self.last_failed = True
+            self.last_reason = "invalid json"
             return []
 
         if not isinstance(payload, dict):
             return []
 
         result_list = payload.get("resultList") or {}
-        results = result_list.get("result") or []
-        return [r for r in results if isinstance(r, dict)]
+        results = [r for r in (result_list.get("result") or []) if isinstance(r, dict)]
+        self._records_seen += len(results)
+        return results
 
     def _candidates_from_results(
         self,
@@ -168,9 +191,14 @@ class EuropePMCSourceProvider:
         exact_lookup: bool,
         title_match_score: float | None,
     ) -> list[SourceCandidate]:
-        is_oa = str(article.get("isOpenAccess") or "").upper() == "Y"
-        if not is_oa:
+        in_epmc = str(article.get("inEPMC") or "").upper() == "Y"
+        has_pdf = str(article.get("hasPDF") or "").upper() == "Y"
+        if not (in_epmc and has_pdf):
             return []
+        # The OA subset carries the publisher's version under an open licence; the rest of
+        # what is in EPMC is an author manuscript. Only `prefer_publisher_version` scoring
+        # depends on this -- both download the same way.
+        is_oa = str(article.get("isOpenAccess") or "").upper() == "Y"
 
         pmcid_raw = article.get("pmcid") or ""
         pmid = article.get("pmid") or article.get("extId")
@@ -199,13 +227,15 @@ class EuropePMCSourceProvider:
                 source_name=self.name,
                 pdf_url=pdf_url,
                 landing_page_url=landing_page_url,
-                version_type="publisher",
+                version_type="publisher" if is_oa else "accepted",
                 host_type="repository",
                 license=article.get("license"),
                 domain=_domain_from_url(pdf_url),
                 confidence=base_confidence,
                 is_direct_pdf=pdf_url.lower().endswith(".pdf") or "pdf" in pdf_url.lower(),
                 title_match_score=title_match_score,
+                # In Europe PMC with a PDF *is* the assertion that a free copy exists.
+                asserts_open_access=True,
                 reason="europepmc exact id lookup" if exact_lookup else "europepmc title search",
                 metadata={
                     "pmcid": f"PMC{pmcid}" if pmcid else None,
@@ -214,6 +244,7 @@ class EuropePMCSourceProvider:
                     "work_title": article_title,
                     "pub_year": pub_year,
                     "source": source,
+                    "is_open_access": is_oa,
                 },
             )
         ]

@@ -9,8 +9,18 @@ import requests
 from paper_downloader.core import host_gate
 
 from paper_downloader.config.models import ApiConfig, DownloadConfig, ResolutionConfig
+from paper_downloader.metadata.pmc import (
+    europepmc_landing_url,
+    europepmc_render_url,
+    normalize_pmcid,
+    pmcid_from_url,
+)
 from paper_downloader.models.paper import PaperRecord
 from paper_downloader.resolve.resolver import SourceCandidate, validate_title_match
+
+#: A location whose only URL is an article page, not a file. Below every direct-PDF
+#: confidence: the page still has to be read and its link followed.
+_LANDING_ONLY_CONFIDENCE = {True: 0.60, False: 0.45}
 
 
 def _domain_from_url(url: str | None) -> str | None:
@@ -67,6 +77,8 @@ class OpenAlexSourceProvider:
     base_url: str = "https://api.openalex.org"
     name: str = "openalex"
     _session: requests.Session = field(default=None, init=False, repr=False)  # type: ignore[assignment]
+    last_reason: str | None = field(default=None, init=False, repr=False)
+    last_failed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._session = host_gate.GatedSession()
@@ -77,10 +89,14 @@ class OpenAlexSourceProvider:
             self._session.close()
 
     def resolve(self, paper: PaperRecord) -> list[SourceCandidate]:
+        self.last_reason = None
+        self.last_failed = False
         candidates: list[SourceCandidate] = []
 
         if paper.doi:
             work = self._fetch_work_by_doi(paper.doi)
+            if work is None and not self.last_failed:
+                self.last_reason = "doi unknown to openalex"
             if work:
                 candidates.extend(
                     self._candidates_from_work(
@@ -147,17 +163,23 @@ class OpenAlexSourceProvider:
                 allow_redirects=True,
                 verify=self.download_config.verify_ssl,
             )
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            self.last_failed = True
+            self.last_reason = f"request failed: {exc.__class__.__name__}"
             return None
 
         if response.status_code == 404:
             return None
         if response.status_code >= 400:
+            self.last_failed = True
+            self.last_reason = f"http {response.status_code}"
             return None
 
         try:
             payload = response.json()
         except ValueError:
+            self.last_failed = True
+            self.last_reason = "invalid json"
             return None
 
         return payload if isinstance(payload, dict) else None
@@ -215,22 +237,70 @@ class OpenAlexSourceProvider:
 
         seen_urls: set[str] = set()
         candidates: list[SourceCandidate] = []
+        work_is_oa = bool(open_access.get("is_oa")) if isinstance(open_access, dict) else False
+        landing_only = 0
+
+        common = {
+            "openalex_id": openalex_id,
+            "work_title": work_title,
+            "work_doi": work_doi,
+            "open_access_oa_status": open_access.get("oa_status") if isinstance(open_access, dict) else None,
+            "relevance_score": relevance_score,
+        }
+
+        def add(candidate: SourceCandidate) -> None:
+            if candidate.pdf_url in seen_urls:
+                return
+            seen_urls.add(candidate.pdf_url)
+            candidates.append(candidate)
+
+        # OpenAlex knows the PMCID as a URL under `ids`. PMC's own PDF endpoint needs a
+        # browser; Europe PMC serves the same file directly, so every PMCID becomes a
+        # Europe PMC candidate whatever the locations say.
+        ids = work.get("ids") if isinstance(work.get("ids"), dict) else {}
+        pmcid = pmcid_from_url(ids.get("pmcid")) or normalize_pmcid(ids.get("pmcid"))
+        if pmcid:
+            add(self._europepmc_candidate(
+                pmcid, base_confidence, title_match_score=title_match_score,
+                exact_lookup=exact_lookup, metadata=common,
+            ))
 
         for location in raw_locations:
             pdf_url = location.get("pdf_url") or location.get("url_for_pdf")
             landing_page_url = location.get("landing_page_url") or location.get("url_for_landing_page")
+            location_is_oa = location.get("is_oa")
+            asserts_oa = bool(location_is_oa) if location_is_oa is not None else work_is_oa
 
             if not pdf_url:
                 oa_url = open_access.get("oa_url") if isinstance(open_access, dict) else None
                 if isinstance(oa_url, str) and oa_url.lower().endswith(".pdf"):
                     pdf_url = oa_url
 
-            if not pdf_url:
+            # A PMC location, with or without a pdf_url, is best fetched from Europe PMC.
+            location_pmcid = pmcid_from_url(pdf_url) or pmcid_from_url(landing_page_url)
+            if location_pmcid:
+                add(self._europepmc_candidate(
+                    location_pmcid, base_confidence, title_match_score=title_match_score,
+                    exact_lookup=exact_lookup, metadata=common,
+                ))
                 continue
 
-            if pdf_url in seen_urls:
-                continue
-            seen_urls.add(pdf_url)
+            is_direct_pdf = True
+            confidence = base_confidence
+            if not pdf_url:
+                # Landing page only. Still worth a candidate: the page usually carries a
+                # citation_pdf_url link the download stage can follow. Not on doi.org,
+                # which only bounces to the publisher (publisher_landing does that
+                # properly), and not on a denied host.
+                if not landing_page_url:
+                    continue
+                landing_domain = _domain_from_url(landing_page_url)
+                if landing_domain in {"doi.org", "dx.doi.org"} or host_gate.is_denied(landing_page_url):
+                    continue
+                landing_only += 1
+                pdf_url = landing_page_url
+                is_direct_pdf = False
+                confidence = _LANDING_ONLY_CONFIDENCE[exact_lookup]
 
             source = location.get("source") or {}
             source_type = source.get("type") if isinstance(source, dict) else None
@@ -244,7 +314,7 @@ class OpenAlexSourceProvider:
             if version_type == "unknown" and host_type == "publisher":
                 version_type = "publisher"
 
-            candidates.append(
+            add(
                 SourceCandidate(
                     source_name=self.name,
                     pdf_url=pdf_url,
@@ -253,23 +323,55 @@ class OpenAlexSourceProvider:
                     host_type=host_type,
                     license=location.get("license"),
                     domain=domain,
-                    confidence=base_confidence,
-                    is_direct_pdf=True,
+                    confidence=confidence,
+                    is_direct_pdf=is_direct_pdf,
                     title_match_score=title_match_score,
-                    reason="openalex exact doi lookup" if exact_lookup else "openalex title fallback",
+                    asserts_open_access=asserts_oa,
+                    reason=(
+                        ("openalex exact doi lookup" if exact_lookup else "openalex title fallback")
+                        + ("" if is_direct_pdf else " (landing page only)")
+                    ),
                     metadata={
-                        "openalex_id": openalex_id,
-                        "work_title": work_title,
-                        "work_doi": work_doi,
+                        **common,
                         "source_display_name": source_display_name,
                         "source_type": source_type,
-                        "open_access_oa_status": open_access.get("oa_status") if isinstance(open_access, dict) else None,
-                        "relevance_score": relevance_score,
                     },
                 )
             )
 
+        if not candidates:
+            self.last_reason = (
+                f"{len(raw_locations)} location(s), none with a usable url"
+                if raw_locations else "work has no locations"
+            )
+        elif landing_only and landing_only == len(candidates):
+            self.last_reason = f"{landing_only} location(s), all landing-only"
+
         return candidates
+
+    def _europepmc_candidate(
+        self,
+        pmcid: str,
+        base_confidence: float,
+        *,
+        title_match_score: float | None,
+        exact_lookup: bool,
+        metadata: dict[str, Any],
+    ) -> SourceCandidate:
+        return SourceCandidate(
+            source_name=self.name,
+            pdf_url=europepmc_render_url(pmcid),
+            landing_page_url=europepmc_landing_url(pmcid),
+            version_type="accepted",
+            host_type="repository",
+            domain="europepmc.org",
+            confidence=base_confidence,
+            is_direct_pdf=True,
+            title_match_score=title_match_score,
+            asserts_open_access=True,
+            reason="pmcid via openalex" + ("" if exact_lookup else " (title fallback)"),
+            metadata={**metadata, "pmcid": f"PMC{pmcid}"},
+        )
 
     def _deduplicate(self, candidates: list[SourceCandidate]) -> list[SourceCandidate]:
         deduped: dict[str, SourceCandidate] = {}

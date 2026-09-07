@@ -19,6 +19,11 @@ from paper_downloader.core.stages import PipelineStage
 from paper_downloader.download.downloader import PDFDownloader, DownloadResult
 from paper_downloader.download.landing_page import extract_pdf_url
 from paper_downloader.inputs.parser import parse_inputs
+from paper_downloader.metadata.pmc import (
+    europepmc_render_url,
+    is_pmc_interstitial,
+    pmcid_from_url,
+)
 from paper_downloader.metadata.semantic_scholar import SemanticScholarClient
 from paper_downloader.models.manifest import PipelineManifest
 from paper_downloader.models.paper import PaperRecord
@@ -71,6 +76,13 @@ class DownloadPipelineResult:
     failure_stage: str | None = None
     failure_code: str | None = None
     error: str | None = None
+    #: Providers that said a free copy of this paper exists (see
+    #: `SourceCandidate.asserts_open_access`). Non-empty on a failure means "open access
+    #: but this client could not fetch it", which a caller must keep apart from "not free".
+    oa_asserted_by: list[str] = field(default_factory=list)
+    #: Why the paper has no PDF, in one word a caller can branch on. One of
+    #: FAILURE_REASONS, or None on success.
+    failure_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -91,7 +103,22 @@ class DownloadPipelineResult:
             "failure_stage": self.failure_stage,
             "failure_code": self.failure_code,
             "error": self.error,
+            "oa_asserted_by": list(self.oa_asserted_by),
+            "failure_reason": self.failure_reason,
         }
+
+
+#: The vocabulary of `DownloadPipelineResult.failure_reason`, most to least decisive when
+#: several attempts say different things (see `_failure_reason`).
+FAILURE_REASONS = (
+    "host_refused_client",   # a host turned this client away; nothing learned about the paper
+    "host_denied",           # a host on the configured deny list was never asked
+    "transient",             # 5xx, 429, network error, metadata lookup -- try again later
+    "page_without_link",     # reached an article page whose PDF needs a browser
+    "withdrawn",             # the arXiv copy was withdrawn
+    "not_free",              # 401/403 on the article itself, or no candidate anywhere
+    "dead_link",             # every URL on record answers 404 or the like
+)
 
 
 class DownloadOrchestrator:
@@ -114,6 +141,12 @@ class DownloadOrchestrator:
         )
         self.downloader = downloader or PDFDownloader(config.download)
         self.logger = logging.getLogger("paper_downloader")
+
+        # Both are process-wide facts, so they live in host_gate rather than on this
+        # object: every downloader and every provider session in the process must agree
+        # on which hosts are off limits and which have refused us lately.
+        host_gate.set_denied_hosts(config.download.denied_hosts)
+        host_gate.configure_persistence(Path(config.output.root_dir) / "host_refusals.json")
 
         if resolver is None:
             resolver = self._build_resolver(config)
@@ -139,7 +172,7 @@ class DownloadOrchestrator:
             "metadata_open_access": MetadataOpenAccessProvider,
             "acl": ACLSourceProvider,
             "cvf": lambda: CVFSourceProvider(config.download, config.resolution),
-            "arxiv": ArxivSourceProvider,
+            "arxiv": lambda: ArxivSourceProvider(config.download, config.resolution),
             "openalex": lambda: OpenAlexSourceProvider(config.apis, config.download, config.resolution),
             "unpaywall": lambda: UnpaywallSourceProvider(config.apis, config.download, config.resolution),
             "europepmc": lambda: EuropePMCSourceProvider(config.download, config.resolution),
@@ -234,7 +267,8 @@ class DownloadOrchestrator:
 
             resolution = self._handle_resolution_stage(manifest, working_paper, index=index, total=total)
             download_result = self._handle_download_stage(
-                manifest, resolution, index=index, total=total, paper=paper
+                manifest, resolution, index=index, total=total, paper=paper,
+                resolve_paper=working_paper,
             )
 
             manifest.batch_status = BatchStatus.PARTIAL_SUCCESS
@@ -304,6 +338,13 @@ class DownloadOrchestrator:
                     getattr(exc, "download_attempts", []) or []
                 )
 
+            oa_asserted_by = self._oa_asserted_by(manifest)
+            failure_reason = self._failure_reason(failure_code, download_attempts, provider_attempts)
+            if manifest is not None:
+                manifest.stats["failure_reason"] = failure_reason
+                manifest.stats["oa_asserted_by"] = oa_asserted_by
+                self.manifest_store.save(manifest)
+
             return DownloadPipelineResult(
                 paper_key=working_paper.paper_key,
                 original_paper_key=paper.paper_key,
@@ -324,7 +365,72 @@ class DownloadOrchestrator:
                 failure_stage=failure_stage,
                 failure_code=failure_code,
                 error=str(exc),
+                oa_asserted_by=oa_asserted_by,
+                failure_reason=failure_reason,
             )
+
+    @staticmethod
+    def _oa_asserted_by(manifest: PipelineManifest | None) -> list[str]:
+        """Providers whose candidates carried an open-access assertion, in chain order."""
+        if manifest is None:
+            return []
+        resolution_stats = manifest.stats.get("resolution") or {}
+        names: list[str] = []
+        for candidate in resolution_stats.get("all_candidates") or []:
+            if isinstance(candidate, dict) and candidate.get("asserts_open_access"):
+                name = candidate.get("source_name")
+                if name and name not in names:
+                    names.append(name)
+        return names
+
+    @staticmethod
+    def _failure_reason(
+        failure_code: str,
+        attempts: list[dict[str, Any]],
+        provider_attempts: list[dict[str, Any]],
+    ) -> str:
+        """One word for why there is no PDF, read off what actually happened.
+
+        Several attempts may disagree; the order in FAILURE_REASONS decides. A host turning
+        us away outranks everything because it says nothing about the paper; a transient
+        error outranks a permanent-looking one because a re-run might succeed; a page that
+        needs a browser outranks "not free" because a person could still get it.
+        """
+        if failure_code == "unresolved_no_legal_pdf":
+            return "not_free"
+        if failure_code in ("metadata_fetch_failed", "resolution_failed", "pipeline_error"):
+            return "transient"
+        if not attempts:
+            return "transient"
+
+        found: set[str] = set()
+        for a in attempts:
+            status = a.get("http_status")
+            if a.get("host_blocked"):
+                found.add("host_denied" if a.get("host_denied") else "host_refused_client")
+            elif status is not None and (status >= 500 or status == 429):
+                found.add("transient")
+            elif a.get("not_a_pdf"):
+                found.add("page_without_link")
+            elif status == 404 and a.get("source_name") == "arxiv":
+                # arXiv answers 404 for exactly one thing: an id whose PDF was withdrawn.
+                found.add("withdrawn")
+            elif status in (401, 403):
+                found.add("not_free")
+            elif status is not None:
+                found.add("dead_link")
+            else:
+                # No status and not a page: the request never completed.
+                found.add("transient")
+
+        if any("withdrawn" in str(pa.get("reason") or "") for pa in provider_attempts
+               if pa.get("source_name") == "arxiv"):
+            found.add("withdrawn")
+
+        for reason in FAILURE_REASONS:
+            if reason in found:
+                return reason
+        return "transient"
 
     def _prepare_paper(
         self, paper: PaperRecord, *, index: int, total: int
@@ -476,13 +582,9 @@ class DownloadOrchestrator:
             self.manifest_store.update_selected_source(manifest, resolution.selected.to_dict())
             self.manifest_store.save(manifest)
 
-            for attempt in resolution.provider_attempts:
-                if attempt.status == "failed":
-                    self._log(index, total, self._ref(paper), f"{attempt.source_name} failed | {attempt.error}")
-                elif attempt.status == "no_candidates":
-                    self._log(index, total, self._ref(paper), f"{attempt.source_name} returned no candidates")
-                else:
-                    self._log(index, total, self._ref(paper), f"{attempt.source_name} returned {attempt.candidate_count} candidate(s)")
+            self._log_provider_attempts(
+                [a.to_dict() for a in resolution.provider_attempts], index=index, total=total, paper=paper,
+            )
 
             self.manifest_store.update_stage(
                 manifest, PipelineStage.RESOLVE_SOURCE, StageStatus.SUCCEEDED,
@@ -505,22 +607,39 @@ class DownloadOrchestrator:
             manifest.stats["resolution"] = {"provider_attempts": provider_attempts}
             self.manifest_store.save(manifest)
 
-            for attempt in provider_attempts:
-                source_name = attempt.get("source_name")
-                status = attempt.get("status")
-                error = attempt.get("error")
-                count = attempt.get("candidate_count", 0)
-                if status == "failed":
-                    self._log(index, total, self._ref(paper), f"{source_name} failed | {error}")
-                elif status == "no_candidates":
-                    self._log(index, total, self._ref(paper), f"{source_name} returned no candidates")
-                else:
-                    self._log(index, total, self._ref(paper), f"{source_name} returned {count} candidate(s)")
+            self._log_provider_attempts(provider_attempts, index=index, total=total, paper=paper)
 
             self.manifest_store.update_stage(
                 manifest, PipelineStage.RESOLVE_SOURCE, StageStatus.FAILED, error=str(exc),
             )
             raise ResolutionError(str(exc)) from exc
+
+    def _log_provider_attempts(
+        self, attempts: list[dict[str, Any]], *, index: int, total: int, paper: PaperRecord,
+    ) -> None:
+        for attempt in attempts:
+            source_name = attempt.get("source_name")
+            status = attempt.get("status")
+            count = attempt.get("candidate_count", 0)
+            reason = attempt.get("reason") or attempt.get("error")
+            suffix = f" | {reason}" if reason else ""
+            if status == "failed":
+                self._log(index, total, self._ref(paper), f"{source_name} failed{suffix}")
+            elif status == "no_candidates":
+                self._log(index, total, self._ref(paper), f"{source_name} returned no candidates{suffix}")
+            else:
+                self._log(index, total, self._ref(paper), f"{source_name} returned {count} candidate(s){suffix}")
+
+    def _record_resolution_round(self, manifest: PipelineManifest, more: ResolutionResult) -> None:
+        """Append a `resolve_more` round to the manifest's resolution record."""
+        stats = manifest.stats.get("resolution")
+        if not isinstance(stats, dict):
+            stats = {}
+            manifest.stats["resolution"] = stats
+        stats.setdefault("provider_attempts", []).extend(a.to_dict() for a in more.provider_attempts)
+        stats.setdefault("attempted_sources", []).extend(more.attempted_sources)
+        stats.setdefault("all_candidates", []).extend(c.to_dict() for c in more.all_candidates)
+        stats["rounds"] = int(stats.get("rounds") or 1) + 1
 
     def _handle_download_stage(
         self,
@@ -530,15 +649,31 @@ class DownloadOrchestrator:
         index: int,
         total: int,
         paper: PaperRecord,
+        resolve_paper: PaperRecord | None = None,
     ) -> DownloadResult:
+        """Try every candidate; when all fail, ask the providers not yet asked, and repeat.
+
+        Resolution stops at the first "good enough" candidate, and that candidate can 403.
+        Before this the 403 ended the paper: 12 of 109 failed papers in one production run
+        had stopped at an OpenAlex or Unpaywall URL that then failed, with Europe PMC three
+        providers further down holding a free copy nobody asked for. Now the chain resumes
+        (`SourceResolver.resolve_more`) until a download succeeds or no provider is left;
+        only then is it a `DownloadError`, and every attempt of every round is on the
+        manifest.
+
+        `paper` is the input record, used for log references; `resolve_paper` is the
+        record after metadata enrichment, which is what the providers need.
+        """
         output_pdf_path = manifest.output_paths["pdf"]
+        resolve_paper = resolve_paper or paper
 
         if self._is_stage_completed(manifest, PipelineStage.DOWNLOAD_PDF) and Path(output_pdf_path).exists():
             download_stats = manifest.stats.get("download")
             if isinstance(download_stats, dict):
+                selected_url = resolution.selected.pdf_url if resolution.selected else ""
                 return DownloadResult(
-                    url=download_stats.get("url") or resolution.selected.pdf_url,
-                    final_url=download_stats.get("final_url") or resolution.selected.pdf_url,
+                    url=download_stats.get("url") or selected_url,
+                    final_url=download_stats.get("final_url") or selected_url,
                     output_path=download_stats.get("output_path") or output_pdf_path,
                     content_type=download_stats.get("content_type"),
                     size_bytes=int(download_stats.get("size_bytes") or 0),
@@ -553,72 +688,101 @@ class DownloadOrchestrator:
 
         attempts: list[dict[str, Any]] = []
         last_error: str | None = None
+        tried_urls: set[str] = set()
+        asked = list(resolution.attempted_sources)
+        candidates = list(resolution.all_candidates)
+        attempt_no = 0
+        round_no = 1
 
-        for candidate_index, candidate in enumerate(resolution.all_candidates, start=1):
-            self._log(
-                index, total, self._ref(paper),
-                f"trying candidate {candidate_index}/{len(resolution.all_candidates)} | {candidate.source_name} | {candidate.pdf_url}",
-            )
-            attempted_url = candidate.pdf_url
-            try:
-                try:
-                    result = self.downloader.download(
-                        candidate.pdf_url,
-                        output_pdf_path,
-                        skip_if_valid=self.config.resume.verify_existing_files,
-                    )
-                except NotAPDFError as exc:
-                    result, attempted_url = self._retry_via_landing_page(
-                        exc, candidate, output_pdf_path, index=index, total=total, paper=paper,
-                    )
-                attempts.append({
-                    "candidate_index": candidate_index,
-                    "source_name": candidate.source_name,
-                    "pdf_url": attempted_url,
-                    "status": "succeeded",
-                    "error": None,
-                    "result": result.to_dict(),
-                })
-                manifest.stats["download"] = result.to_dict()
-                manifest.stats["download_attempts"] = attempts
-                self.manifest_store.update_selected_source(manifest, candidate.to_dict())
-                self.manifest_store.save(manifest)
-
-                self.manifest_store.update_stage(
-                    manifest, PipelineStage.DOWNLOAD_PDF, StageStatus.SUCCEEDED,
-                    message="pdf downloaded",
-                    details={
-                        **result.to_dict(),
-                        "selected_source_name": candidate.source_name,
-                        "candidate_index": candidate_index,
-                    },
+        while True:
+            for candidate in candidates:
+                if candidate.pdf_url in tried_urls:
+                    continue
+                tried_urls.add(candidate.pdf_url)
+                attempt_no += 1
+                self._log(
+                    index, total, self._ref(paper),
+                    f"trying candidate {attempt_no} (round {round_no}) | {candidate.source_name} | {candidate.pdf_url}",
                 )
-                self._log(index, total, self._ref(paper), f"pdf downloaded | source={candidate.source_name}")
-                return result
+                attempted_url = candidate.pdf_url
+                try:
+                    try:
+                        result = self.downloader.download(
+                            candidate.pdf_url,
+                            output_pdf_path,
+                            skip_if_valid=self.config.resume.verify_existing_files,
+                        )
+                    except NotAPDFError as exc:
+                        result, attempted_url = self._retry_via_landing_page(
+                            exc, candidate, output_pdf_path, index=index, total=total, paper=paper,
+                        )
+                    attempts.append({
+                        "candidate_index": attempt_no,
+                        "round": round_no,
+                        "source_name": candidate.source_name,
+                        "pdf_url": attempted_url,
+                        "status": "succeeded",
+                        "error": None,
+                        "result": result.to_dict(),
+                    })
+                    manifest.stats["download"] = result.to_dict()
+                    manifest.stats["download_attempts"] = attempts
+                    self.manifest_store.update_selected_source(manifest, candidate.to_dict())
+                    self.manifest_store.save(manifest)
 
-            except Exception as exc:
-                last_error = str(exc)
-                attempts.append({
-                    "candidate_index": candidate_index,
-                    "source_name": candidate.source_name,
-                    "pdf_url": attempted_url,
-                    "status": "failed",
-                    "error": str(exc),
-                    "http_status": getattr(exc, "status_code", None),
-                    "not_a_pdf": isinstance(exc, NotAPDFError),
-                    # Whether the host turned this server away rather than answering about
-                    # the paper. A caller deciding "is this paper worth another attempt"
-                    # cannot tell from the status alone -- see host_gate.
-                    "host_blocked": isinstance(exc, HostBlockedError),
-                    "host": getattr(exc, "host", "") or host_gate.host_key(attempted_url),
-                })
-                manifest.stats["download_attempts"] = attempts
-                self.manifest_store.save(manifest)
+                    self.manifest_store.update_stage(
+                        manifest, PipelineStage.DOWNLOAD_PDF, StageStatus.SUCCEEDED,
+                        message="pdf downloaded",
+                        details={
+                            **result.to_dict(),
+                            "selected_source_name": candidate.source_name,
+                            "candidate_index": attempt_no,
+                        },
+                    )
+                    self._log(index, total, self._ref(paper), f"pdf downloaded | source={candidate.source_name}")
+                    return result
 
-                fallback_msg = f"{candidate.source_name} download failed | {exc}"
-                if candidate_index < len(resolution.all_candidates):
-                    fallback_msg = f"{fallback_msg} | trying next candidate"
-                self._log(index, total, self._ref(paper), fallback_msg)
+                except Exception as exc:
+                    last_error = str(exc)
+                    attempts.append({
+                        "candidate_index": attempt_no,
+                        "round": round_no,
+                        "source_name": candidate.source_name,
+                        "pdf_url": attempted_url,
+                        "status": "failed",
+                        "error": str(exc),
+                        "http_status": getattr(exc, "status_code", None),
+                        "not_a_pdf": isinstance(exc, NotAPDFError),
+                        # Whether the host turned this server away rather than answering
+                        # about the paper. A caller deciding "is this paper worth another
+                        # attempt" cannot tell from the status alone -- see host_gate.
+                        "host_blocked": isinstance(exc, HostBlockedError),
+                        # ...and whether that was the deny list rather than an observed
+                        # refusal. The caller's stored detail must not confuse the two.
+                        "host_denied": bool(getattr(exc, "denied", False)),
+                        "host": getattr(exc, "host", "") or host_gate.host_key(attempted_url),
+                    })
+                    manifest.stats["download_attempts"] = attempts
+                    self.manifest_store.save(manifest)
+                    self._log(index, total, self._ref(paper), f"{candidate.source_name} download failed | {exc}")
+
+            # Every candidate so far has failed. Ask the providers the early stop skipped.
+            more = self.resolver.resolve_more(resolve_paper, already_asked=asked)
+            if more is None:
+                break
+            round_no += 1
+            asked.extend(name for name in more.attempted_sources if name not in asked)
+            self._record_resolution_round(manifest, more)
+            self.manifest_store.save(manifest)
+            self._log_provider_attempts(
+                [a.to_dict() for a in more.provider_attempts], index=index, total=total, paper=paper,
+            )
+            candidates = [c for c in more.all_candidates if c.pdf_url not in tried_urls]
+            if candidates:
+                self._log(
+                    index, total, self._ref(paper),
+                    f"all candidates failed | {len(candidates)} more from round {round_no}",
+                )
 
         summary_error = last_error or "all download candidates failed"
         self.manifest_store.update_stage(
@@ -644,11 +808,27 @@ class DownloadOrchestrator:
         freely available paper is reported as undownloadable. One hop only, and only to a
         link the page itself offers: no crawling, no guessing at URL patterns.
 
+        One exception to "only what the page offers": PMC's PDF endpoint answers with a
+        small "Preparing to download" page that fetches the file from JavaScript. That is
+        not a page without a PDF, it is a PDF this client cannot reach at this host --
+        Europe PMC serves the same file directly, so the request is rewritten there.
+
         Re-raises the original NotAPDFError when the page offers nothing, so the caller
         still sees the real reason and moves on to the next candidate.
         """
         if not self.config.download.landing_page_fallback:
             raise exc
+
+        rewritten = self._pmc_rewrite(exc)
+        if rewritten:
+            self._log(
+                index, total, self._ref(paper),
+                f"{candidate.source_name} hit PMC's download interstitial | fetching from Europe PMC | {rewritten}",
+            )
+            result = self.downloader.download(
+                rewritten, output_pdf_path, skip_if_valid=self.config.resume.verify_existing_files,
+            )
+            return result, rewritten
 
         landing_url = exc.final_url or candidate.pdf_url
         pdf_url = extract_pdf_url(exc.body, landing_url)
@@ -669,13 +849,36 @@ class DownloadOrchestrator:
             index, total, self._ref(paper),
             f"{candidate.source_name} served a landing page | following its PDF link | {pdf_url}",
         )
-        result = self.downloader.download(
-            pdf_url,
-            output_pdf_path,
-            skip_if_valid=self.config.resume.verify_existing_files,
-            referer=landing_url,
-        )
+        try:
+            result = self.downloader.download(
+                pdf_url,
+                output_pdf_path,
+                skip_if_valid=self.config.resume.verify_existing_files,
+                referer=landing_url,
+            )
+        except NotAPDFError as second:
+            # The page's own PDF link may be the PMC interstitial (a PMC article page
+            # links to its /pdf/ endpoint). Same rewrite, one more hop.
+            rewritten = self._pmc_rewrite(second)
+            if not rewritten:
+                raise
+            self._log(
+                index, total, self._ref(paper),
+                f"{candidate.source_name}'s PDF link is PMC's download interstitial | fetching from Europe PMC | {rewritten}",
+            )
+            result = self.downloader.download(
+                rewritten, output_pdf_path, skip_if_valid=self.config.resume.verify_existing_files,
+            )
+            return result, rewritten
         return result, pdf_url
+
+    @staticmethod
+    def _pmc_rewrite(exc: NotAPDFError) -> str | None:
+        """The Europe PMC render URL for a PMC interstitial, or None if this is not one."""
+        if not is_pmc_interstitial(exc.final_url, exc.body):
+            return None
+        pmcid = pmcid_from_url(exc.final_url)
+        return europepmc_render_url(pmcid) if pmcid else None
 
     def _is_stage_completed(self, manifest: PipelineManifest, stage: PipelineStage) -> bool:
         if not self.config.resume.enabled or not self.config.resume.skip_completed_stages:

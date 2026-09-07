@@ -145,6 +145,7 @@ def _paper_from_metadata_record(record: dict[str, Any]) -> PaperRecord:
         dblp_id=ids.get("dblp_id"),
         acl_id=ids.get("acl_id"),
         pmid=ids.get("pmid"),
+        pmcid=ids.get("pmcid"),
         corpus_id=ids.get("corpus_id"),
         input_value=ids.get("semantic_scholar_paper_id"),
     )

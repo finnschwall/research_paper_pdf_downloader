@@ -9,8 +9,17 @@ import requests
 from paper_downloader.core import host_gate
 
 from paper_downloader.config.models import ApiConfig, DownloadConfig, ResolutionConfig
+from paper_downloader.metadata.pmc import (
+    europepmc_landing_url,
+    europepmc_render_url,
+    pmcid_from_url,
+)
 from paper_downloader.models.paper import PaperRecord
 from paper_downloader.resolve.resolver import SourceCandidate, validate_title_match
+
+#: A location whose only URL is an article page, not a file. Below every direct-PDF
+#: confidence: the page still has to be read and its link followed.
+_LANDING_ONLY_CONFIDENCE = {True: 0.60, False: 0.45}
 
 
 def _domain_from_url(url: str | None) -> str | None:
@@ -49,6 +58,8 @@ class UnpaywallSourceProvider:
     base_url: str = "https://api.unpaywall.org/v2"
     name: str = "unpaywall"
     _session: requests.Session = field(default=None, init=False, repr=False)  # type: ignore[assignment]
+    last_reason: str | None = field(default=None, init=False, repr=False)
+    last_failed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._session = host_gate.GatedSession()
@@ -59,13 +70,20 @@ class UnpaywallSourceProvider:
             self._session.close()
 
     def resolve(self, paper: PaperRecord) -> list[SourceCandidate]:
+        self.last_reason = None
+        self.last_failed = False
         if not self.api_config.unpaywall_email:
+            # Unpaywall answers HTTP 422 without a contact address, so the provider is
+            # off. Said here, because "no_candidates" would read as "no free copy".
+            self.last_reason = "unpaywall email not configured; provider is off"
             return []
 
         candidates: list[SourceCandidate] = []
 
         if paper.doi:
             payload = self._lookup_by_doi(paper.doi)
+            if payload is None and not self.last_failed:
+                self.last_reason = "doi unknown to unpaywall"
             if payload:
                 candidates.extend(
                     self._candidates_from_payload(
@@ -126,17 +144,23 @@ class UnpaywallSourceProvider:
                 allow_redirects=True,
                 verify=self.download_config.verify_ssl,
             )
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            self.last_failed = True
+            self.last_reason = f"request failed: {exc.__class__.__name__}"
             return None
 
         if response.status_code == 404:
             return None
         if response.status_code >= 400:
+            self.last_failed = True
+            self.last_reason = f"http {response.status_code}"
             return None
 
         try:
             payload = response.json()
         except ValueError:
+            self.last_failed = True
+            self.last_reason = "invalid json"
             return None
 
         return payload if isinstance(payload, dict) else None
@@ -175,6 +199,7 @@ class UnpaywallSourceProvider:
         title_match_score: float | None,
     ) -> list[SourceCandidate]:
         if payload.get("is_oa") is False:
+            self.last_reason = "unpaywall says is_oa false"
             return []
 
         base_confidence = 0.88 if exact_lookup else 0.68
@@ -193,26 +218,64 @@ class UnpaywallSourceProvider:
 
         seen_urls: set[str] = set()
         candidates: list[SourceCandidate] = []
+        landing_only = 0
+        common = {"work_title": title, "work_doi": doi, "oa_status": oa_status}
+
+        def add(candidate: SourceCandidate) -> None:
+            if candidate.pdf_url in seen_urls:
+                return
+            seen_urls.add(candidate.pdf_url)
+            candidates.append(candidate)
 
         for location in raw_locations:
             pdf_url = location.get("url_for_pdf")
             landing_page_url = location.get("url_for_landing_page") or location.get("url")
-            if not pdf_url:
+            evidence = location.get("evidence")
+
+            # PMC's PDF endpoint needs a browser; Europe PMC serves the same file.
+            pmcid = pmcid_from_url(pdf_url) or pmcid_from_url(landing_page_url)
+            if pmcid:
+                add(SourceCandidate(
+                    source_name=self.name,
+                    pdf_url=europepmc_render_url(pmcid),
+                    landing_page_url=europepmc_landing_url(pmcid),
+                    version_type=_map_version(location.get("version")) if location.get("version") else "accepted",
+                    host_type="repository",
+                    license=location.get("license"),
+                    domain="europepmc.org",
+                    confidence=base_confidence,
+                    is_direct_pdf=True,
+                    title_match_score=title_match_score,
+                    asserts_open_access=True,
+                    reason="pmcid via unpaywall",
+                    metadata={**common, "evidence": evidence, "pmcid": f"PMC{pmcid}"},
+                ))
                 continue
 
-            if pdf_url in seen_urls:
-                continue
-            seen_urls.add(pdf_url)
+            is_direct_pdf = True
+            confidence = base_confidence
+            if not pdf_url:
+                # Landing page only -- still a candidate, because the page usually carries
+                # the PDF link. Not on doi.org (publisher_landing resolves that properly)
+                # and not on a denied host.
+                if not landing_page_url:
+                    continue
+                landing_domain = _domain_from_url(landing_page_url)
+                if landing_domain in {"doi.org", "dx.doi.org"} or host_gate.is_denied(landing_page_url):
+                    continue
+                landing_only += 1
+                pdf_url = landing_page_url
+                is_direct_pdf = False
+                confidence = _LANDING_ONLY_CONFIDENCE[exact_lookup]
 
             domain = _domain_from_url(pdf_url) or _domain_from_url(landing_page_url)
             host_type = location.get("host_type") or "unknown"
             version_type = _map_version(location.get("version"))
-            evidence = location.get("evidence")
 
             if version_type == "unknown" and host_type == "publisher":
                 version_type = "publisher"
 
-            candidates.append(
+            add(
                 SourceCandidate(
                     source_name=self.name,
                     pdf_url=pdf_url,
@@ -221,18 +284,26 @@ class UnpaywallSourceProvider:
                     host_type=host_type,
                     license=location.get("license"),
                     domain=domain,
-                    confidence=base_confidence,
-                    is_direct_pdf=True,
+                    confidence=confidence,
+                    is_direct_pdf=is_direct_pdf,
                     title_match_score=title_match_score,
-                    reason="unpaywall exact doi lookup" if exact_lookup else "unpaywall title fallback",
-                    metadata={
-                        "work_title": title,
-                        "work_doi": doi,
-                        "oa_status": oa_status,
-                        "evidence": evidence,
-                    },
+                    # Every oa_location Unpaywall lists is its claim that a free copy exists.
+                    asserts_open_access=True,
+                    reason=(
+                        ("unpaywall exact doi lookup" if exact_lookup else "unpaywall title fallback")
+                        + ("" if is_direct_pdf else " (landing page only)")
+                    ),
+                    metadata={**common, "evidence": evidence},
                 )
             )
+
+        if not candidates:
+            self.last_reason = (
+                f"{len(raw_locations)} oa_location(s), none with a usable url"
+                if raw_locations else "is_oa but no oa_locations"
+            )
+        elif landing_only and landing_only == len(candidates):
+            self.last_reason = f"{landing_only} oa_location(s), all landing-only"
 
         return candidates
 

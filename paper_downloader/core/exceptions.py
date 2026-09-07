@@ -56,9 +56,13 @@ class HostBlockedError(DownloadError):
     paper is worth another attempt once the block ages out.
     """
 
-    def __init__(self, message: str, *, host: str = "") -> None:
+    def __init__(self, message: str, *, host: str = "", denied: bool = False) -> None:
         super().__init__(message)
         self.host = host
+        #: True when the host was never asked because it is on the configured deny list,
+        #: as opposed to having actually refused a request. Callers storing the detail
+        #: must not describe the first as the second.
+        self.denied = denied
 
 
 class HTTPStatusError(DownloadError):

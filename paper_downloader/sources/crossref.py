@@ -66,6 +66,9 @@ class CrossrefSourceProvider:
     base_url: str = "https://api.crossref.org"
     name: str = "crossref"
     _session: requests.Session = field(default=None, init=False, repr=False)  # type: ignore[assignment]
+    last_reason: str | None = field(default=None, init=False, repr=False)
+    last_failed: bool = field(default=False, init=False, repr=False)
+    _similarity_only: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._session = host_gate.GatedSession()
@@ -76,11 +79,15 @@ class CrossrefSourceProvider:
             self._session.close()
 
     def resolve(self, paper: PaperRecord) -> list[SourceCandidate]:
+        self.last_reason = None
+        self.last_failed = False
+        self._similarity_only = 0
         candidates: list[SourceCandidate] = []
 
-       
         if paper.doi:
             work = self._fetch_by_doi(paper.doi)
+            if work is None and not self.last_failed:
+                self.last_reason = "doi unknown to crossref"
             if work:
                 candidates.extend(
                     self._candidates_from_work(
@@ -114,6 +121,10 @@ class CrossrefSourceProvider:
                     )
                 )
 
+        if not candidates and self._similarity_only and self.last_reason is None:
+            self.last_reason = (
+                f"{self._similarity_only} link(s), all similarity-checking (behind the publisher wall)"
+            )
         return self._deduplicate(candidates)
 
     def _headers(self) -> dict[str, str]:
@@ -143,17 +154,23 @@ class CrossrefSourceProvider:
                 allow_redirects=True,
                 verify=self.download_config.verify_ssl,
             )
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            self.last_failed = True
+            self.last_reason = f"request failed: {exc.__class__.__name__}"
             return None
 
         if response.status_code == 404:
             return None
         if response.status_code >= 400:
+            self.last_failed = True
+            self.last_reason = f"http {response.status_code}"
             return None
 
         try:
             payload = response.json()
         except ValueError:
+            self.last_failed = True
+            self.last_reason = "invalid json"
             return None
 
         return payload if isinstance(payload, dict) else None
@@ -214,6 +231,13 @@ class CrossrefSourceProvider:
 
             content_is_pdf = "pdf" in content_type or url.lower().endswith(".pdf")
             if not content_is_pdf:
+                continue
+
+            # iThenticate feeds. Every one probed sat behind the publisher's wall
+            # (IEEE's on a staging host that serves nobody); `text-mining` and
+            # unspecified links are the ones that can serve a reader.
+            if intended_app == "similarity-checking":
+                self._similarity_only += 1
                 continue
 
             if is_staging_url(url):    

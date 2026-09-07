@@ -100,6 +100,13 @@ class DownloadConfig:
     landing_page_fallback: bool = True
     landing_page_max_bytes: int = 2_000_000
 
+    # Hosts never to contact, matched by dotted suffix ("acm.org" covers "dl.acm.org").
+    # For publishers known to refuse this client outright: a candidate on a denied host is
+    # kept but tried last and never ends the provider search, and the download stage fails
+    # it as host-blocked without a request -- so the paper is reported as retryable, not
+    # as having no open-access copy. Configuration, not a verdict on any paper.
+    denied_hosts: list[str] = field(default_factory=list)
+
     allowed_content_types: list[str] = field(
         default_factory=lambda: [
             "application/pdf",

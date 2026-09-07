@@ -54,6 +54,7 @@ class PaperRecord:
         dblp_id: str | None = None,
         acl_id: str | None = None,
         pmid: str | None = None,
+        pmcid: str | None = None,
         corpus_id: str | None = None,
     ) -> "PaperRecord":
         authors = []
@@ -102,6 +103,7 @@ class PaperRecord:
             dblp_id=dblp_id,
             acl_id=acl_id,
             pmid=pmid,
+            pmcid=pmcid,
             external_ids=dict(record.get("externalIds") or {}),
             source_urls={
                 k: v

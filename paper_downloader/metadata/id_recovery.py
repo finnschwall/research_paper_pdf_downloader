@@ -5,6 +5,8 @@ import re
 from difflib import SequenceMatcher
 from typing import Any, Mapping
 
+from paper_downloader.metadata.pmc import normalize_pmcid
+
 
 _DOI_EXTRACT_RE = re.compile(r"(10\.\d{4,9}/\S+)", re.IGNORECASE)
 _ARXIV_DIRECT_RE = re.compile(
@@ -142,6 +144,9 @@ def recover_identifiers_from_external_ids(external_ids: Mapping[str, Any] | None
         "dblp_id": dblp_id,
         "acl_id": clean_text(ids.get("ACL")),
         "pmid": clean_text(ids.get("PubMed")),
+        # Semantic Scholar spells it "PubMedCentral", with or without the PMC prefix.
+        # Digits only here; the Europe PMC provider adds the prefix back.
+        "pmcid": normalize_pmcid(ids.get("PubMedCentral")),
         "corpus_id": clean_text(ids.get("CorpusId")),
     }
 
@@ -166,4 +171,5 @@ def recover_identifiers_from_record(record: Mapping[str, Any]) -> dict[str, str 
         "dblp_id": dblp_id,
         "acl_id": recovered["acl_id"] or clean_text(record.get("aclId")),
         "pmid": recovered["pmid"] or clean_text(record.get("pmid")),
+        "pmcid": recovered["pmcid"] or normalize_pmcid(record.get("pmcid")),
     }

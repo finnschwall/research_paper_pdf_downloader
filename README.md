@@ -806,12 +806,12 @@ The pipeline queries up to 11 open-access source providers in priority order. Pr
 | Provider | What it does | API key required |
 |---|---|---|
 | metadata_open_access | Reads the `openAccessPdf` URL directly from Semantic Scholar metadata | No |
-| arxiv | Constructs the PDF URL directly from the ArXiv ID | No |
+| arxiv | Constructs the PDF URL from the ArXiv ID; without one, searches the arXiv API by title and accepts a hit only when the authors also match | No |
 | acl | Constructs the PDF URL from the ACL Anthology ID or ACL DOI | No |
 | cvf | Constructs the PDF URL from the CVF (CVPR/ICCV/ECCV) paper title | No |
 | openalex | Looks up open-access locations via the OpenAlex API | Optional |
 | unpaywall | Looks up open-access locations via the Unpaywall API | Email required |
-| europepmc | Searches EuropePMC for life science papers with full text | No |
+| europepmc | Searches EuropePMC for papers whose full text is in EPMC with a PDF (author manuscripts included) | No |
 | crossref | Extracts PDF links from Crossref work metadata | Optional (email) |
 | core | Searches CORE for repository copies | Key required |
 | zenodo | Searches Zenodo for deposited copies | No |

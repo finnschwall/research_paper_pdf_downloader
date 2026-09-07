@@ -179,6 +179,8 @@ class DOAJSourceProvider:
                     or "/pdf" in effective_pdf_url.lower()
                 ),
                 title_match_score=title_match_score,
+                # Listed in DOAJ means the journal is open access: a free copy exists.
+                asserts_open_access=True,
                 reason="doaj doi lookup" if exact_lookup else "doaj title search",
                 metadata={
                     "work_title": article_title,
