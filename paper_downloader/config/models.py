@@ -138,6 +138,13 @@ class DownloadConfig:
     # as having no open-access copy. Configuration, not a verdict on any paper.
     denied_hosts: list[str] = field(default_factory=list)
 
+    # Read the front pages of every downloaded PDF and check that the paper's own DOI, arXiv
+    # id or title is on them. A file that is legibly a different document is discarded and
+    # the next candidate tried; a file that cannot be checked is kept and marked. Costs a
+    # pypdf parse per download, a quarter of a second on the median paper. See
+    # paper_downloader.download.identity.
+    verify_identity: bool = True
+
     allowed_content_types: list[str] = field(
         default_factory=lambda: [
             "application/pdf",

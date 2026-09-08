@@ -17,9 +17,11 @@ from paper_downloader.core.exceptions import (
     HostBlockedError,
     HTTPStatusError,
     NotAPDFError,
+    WrongPaperError,
     PDFValidationError,
 )
 from paper_downloader.download.entitlement import not_the_full_article
+from paper_downloader.download.identity import ExpectedIdentity, verify_pdf_identity
 from paper_downloader.storage.writers import ensure_parent_dir
 
 logger = logging.getLogger("paper_downloader")
@@ -55,8 +57,11 @@ class DownloadResult:
     size_bytes: int
     sha256: str
     reused_existing: bool = False
+    #: What the identity check concluded: state, reason and the signal that decided it.
+    #: None when the check was off or the caller had nothing to check against.
+    identity: dict | None = None
 
-    def to_dict(self) -> dict[str, str | int | bool | None]:
+    def to_dict(self) -> dict:
         return {
             "url": self.url,
             "final_url": self.final_url,
@@ -65,6 +70,7 @@ class DownloadResult:
             "size_bytes": self.size_bytes,
             "sha256": self.sha256,
             "reused_existing": self.reused_existing,
+            "identity": self.identity,
         }
 
 
@@ -111,12 +117,17 @@ class PDFDownloader:
         *,
         skip_if_valid: bool = True,
         referer: str | None = None,
+        expected: ExpectedIdentity | None = None,
     ) -> DownloadResult:
         """Fetch `url` into `output_path`, retrying only what is worth retrying.
 
         `referer` is sent when we arrived at this URL from a landing page; several
         platforms serve the PDF only to requests that look like they came from the
         article page.
+
+        `expected` is what the caller knows about the paper it asked for. When given, the
+        downloaded PDF's front pages are checked for it and a file that is legibly a
+        different document raises WrongPaperError instead of being kept.
         """
         target_path = Path(output_path)
 
@@ -144,7 +155,7 @@ class PDFDownloader:
 
         for attempt in range(1, attempts + 1):
             try:
-                return self._attempt_download(url, target_path, tmp_path, referer=referer)
+                return self._attempt_download(url, target_path, tmp_path, referer=referer, expected=expected)
             except (NotAPDFError, PDFValidationError):
                 # The server gave us something, it just was not a PDF. Asking again gets
                 # the same thing back.
@@ -181,6 +192,7 @@ class PDFDownloader:
         tmp_path: Path,
         *,
         referer: str | None = None,
+        expected: ExpectedIdentity | None = None,
     ) -> DownloadResult:
         try:
             # Headers go per-request, not onto the session: the session outlives this URL
@@ -265,6 +277,8 @@ class PDFDownloader:
             tmp_path.unlink(missing_ok=True)
             raise
 
+        identity = self._check_identity(tmp_path, expected, final_url=final_url)
+
         tmp_path.replace(target_path)
 
         return DownloadResult(
@@ -275,7 +289,34 @@ class PDFDownloader:
             size_bytes=total_bytes,
             sha256=sha256.hexdigest(),
             reused_existing=False,
+            identity=identity,
         )
+
+    def _check_identity(
+        self, tmp_path: Path, expected: ExpectedIdentity | None, *, final_url: str,
+    ) -> dict | None:
+        """Is this the paper we asked for? Refuses on positive evidence only.
+
+        Every check before this one asks "is it a PDF". This one asks "is it *this* PDF",
+        which the file-type checks cannot: a document the paper cites, a first-page
+        preview and a supplement under the article's DOI all pass them. A verdict that
+        merely could not be reached -- no text layer, nothing to compare against -- keeps
+        the file, because a wrong file kept can be found by re-running the audit and a
+        right file deleted cannot.
+        """
+        if not self.config.verify_identity or expected is None or expected.is_empty():
+            return None
+        expected.source_url = final_url or expected.source_url
+        verdict = verify_pdf_identity(tmp_path, expected)
+        if verdict.positive_rejection:
+            tmp_path.unlink(missing_ok=True)
+            raise WrongPaperError(
+                f"Downloaded PDF is not the requested paper: {verdict.reason}",
+                verdict=verdict.to_dict(), final_url=final_url,
+            )
+        if not verdict.ok:
+            logger.warning("keeping an unverified PDF | %s | %s", verdict.reason, final_url)
+        return verdict.to_dict()
 
     def _get(self, url: str, *, referer: str | None) -> requests.Response:
         headers = self._request_headers(url, referer=referer)

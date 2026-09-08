@@ -161,6 +161,12 @@ def openalex_work(
     return LookupResult(work)
 
 
+def cached_crossref(doi: str | None) -> dict[str, Any] | None:
+    """The Crossref record if a previous stage already fetched it; never a request."""
+    key = normalize_doi(doi)
+    return _crossref.get(key) if key else None
+
+
 def prime_crossref(doi: str | None, work: dict[str, Any] | None) -> None:
     """Put a record already in hand into the cache, so nobody fetches it again."""
     key = normalize_doi(doi)

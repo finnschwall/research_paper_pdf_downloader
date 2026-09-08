@@ -13,6 +13,7 @@ setup(
     install_requires=[
         "requests>=2.31.0",
         "python-dotenv>=1.0.0",
+        "pypdf>=4.0",
     ],
     entry_points={
         "console_scripts": [

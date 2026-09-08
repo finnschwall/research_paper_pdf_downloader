@@ -38,6 +38,7 @@ want the second one, read [Downloading PDFs](#downloading-pdfs) and
 - [Configuration reference](#configuration-reference)
 - [Troubleshooting](#troubleshooting)
 - [Using this from SEER](#using-this-from-seer)
+- [Checking the file is the paper](#checking-the-file-is-the-paper)
 
 ---
 
@@ -195,6 +196,7 @@ One `DownloadPipelineResult` per input paper, in input order.
 | `retracted` | The article has been retracted. Never stops a fetch; it is a flag for whoever screens the corpus |
 | `oa_asserted_by` | Providers that said a free copy exists. Non-empty on a failure means "open access, but this client could not reach it", which is not the same as "not free" |
 | `selected_source` | The candidate that won, with its provider, domain, licence and score |
+| `identity` (in `download`) | What the identity check concluded about the file: `verified` and the signal that decided it, or a state saying why it could not be checked. See [Checking the file is the paper](#checking-the-file-is-the-paper) |
 | `provider_attempts` / `download_attempts` | Every provider asked and every URL tried, with the reason each gave |
 
 Re-running is safe. A paper whose PDF is already on disk and whose manifest shows a completed
@@ -395,6 +397,7 @@ result tells you about the paper itself.
 | `host_refused_client` | An edge denial shaped like a rate or IP limit — 429, `Retry-After`, a refusal that clears elsewhere | Later, or from a different network |
 | `host_denied` | A host on the configured deny list was never asked | When the configuration changes |
 | `transient` | 5xx, timeout, network error, metadata lookup failed | Yes |
+| `wrong_document` | Every PDF that arrived was legibly a different document: one the paper cites, a preview, a supplement. A fact about the source that offered it, not about the paper | When a provider is fixed or added |
 | `page_without_link` | A real article page with no followable PDF link: a JavaScript download button, a repository record with nothing deposited | Not by machine |
 | `withdrawn` | The arXiv copy was withdrawn | No |
 | `not_yet_available` | Published days ago; the publisher serves HTML and no PDF to anyone yet | Yes, in a few weeks — the one reason time alone fixes |
@@ -603,6 +606,7 @@ keywords raises rather than silently ignoring one of them.
 | `download.landing_page_fallback` / `landing_page_max_bytes` | The one-hop landing-page follow, and how much of such a page to read |
 | `download.denied_hosts` | Hosts never to contact, by dotted suffix (`acm.org` covers `dl.acm.org`). Their candidates are kept but tried last and failed without a request, so those papers stay *retryable* rather than being recorded as having no copy |
 | `download.min_pdf_bytes` / `max_pdf_bytes` / `allowed_content_types` | What counts as a PDF |
+| `download.verify_identity` | Whether to read each downloaded PDF's front pages and check it is the requested paper. Default on |
 | `output.root_dir` | Where everything is written. **Set this to an absolute path** if your process's working directory is not fixed |
 | `resume.*` | Stage skipping and existing-file verification |
 
@@ -726,6 +730,7 @@ reason several of the distinctions above exist at all:
 | `failure_reason: client_challenged` | `client_challenged` | Yes — a re-run after a key is configured takes a different route |
 | `oa_asserted_by` non-empty, and a host refused us | `open_access_unfetchable` | Yes |
 | A host refused or was deny-listed | `transient_error`, with a detail saying which | Yes |
+| `failure_reason: wrong_document` | **Not yet mapped.** SEER's classifier reads the attempt list and, seeing no HTTP error and no web page, files it under `no_open_access`, which is permanent. It should be `transient_error`: the paper is fine, a source offered the wrong file | Should be yes |
 | `failure_reason: not_yet_available` | `transient_error`, "try again in a few weeks" | Yes |
 | `failure_reason: withdrawn` | `no_full_text` | Never |
 | 401/403 on the article itself | `blocked_by_publisher` | Only on request |
@@ -740,3 +745,59 @@ document and no run will make it one.
 
 SEER's side of this lives in `papers/enrichment_service.py` and is documented in its
 `docs/subsystems/fulltext-pipeline.md`.
+
+---
+
+## Checking the file is the paper
+
+Everything else in the download stage checks that what arrived *is a PDF*: magic bytes, size,
+content type. None of that says it is the *right* PDF. A landing-page scrape can follow a link
+to a document the paper cites. A publisher can answer with a first-page preview. A repository
+can hold a supplement under the article's DOI. All three pass every file-type check and are
+then stored as the paper, and in a systematic review a wrong full text is worse than none.
+
+So after the file-type checks, and before the file is moved into place, its front pages are
+read and searched for the paper's own identifiers. Any one match is enough:
+
+| Signal | What it looks for | Why it is enough on its own |
+|---|---|---|
+| `doi-in-text` | The requested DOI, in the first three pages | Printed on nearly every version of record |
+| `arxiv-id-in-text` | `arXiv:<id>`, any version, in the first three pages | arXiv stamps it in the margin of every PDF it compiles |
+| `arxiv-id-in-url` | The file came from `arxiv.org/pdf/<id>` for the requested id | arXiv serves by id; whatever title the current version carries, it is that paper |
+| `title-on-page` / `title-near-match` | The title on the first two pages, exact or at 85% after normalisation | Carries accepted manuscripts, which print no publisher DOI |
+| `title-in-metadata` | The PDF's own embedded title | For pages whose text layer lost the title |
+| `page-count-corroborated` | A scan with no text whose page count matches Crossref's page range | The only evidence an image-only scan can offer |
+
+Text is compared after "squashing": HTML entities unescaped, ligatures and accents
+decomposed, everything but letters and digits removed. A title broken across two lines, or
+hyphenated at the break, squashes to the same string as the title in the record.
+
+**The file is refused only on positive evidence.** Two verdicts do that: `wrong_article`, when
+the front pages are legible and name neither the DOI nor the title, or the embedded title is
+plainly about something else; and `truncated`, when the PDF has fewer than half the pages
+the record spans. A refused file is deleted, the attempt is recorded on the manifest with
+what the document called itself, and the download stage moves to the next candidate exactly
+as it does for a web page. A verdict that merely could not be reached, because the PDF has
+no text layer or the record has nothing to compare against, keeps the file and marks it
+`unverified` in the manifest. A wrong file kept can be found by re-running the check; a right
+file deleted cannot.
+
+**Measured on this library's own output before it was switched on.** The 500 PDFs that a SEER
+review had already downloaded were re-judged from their stored metadata:
+
+| Verdict | Papers | What they were |
+|---|---|---|
+| verified | 499 | 340 by arXiv id on the page, 80 by DOI, 75 by title, 4 by arXiv URL |
+| wrong_article | 1 | A 64-page Thai clinical guideline, offered by OpenAlex as the "publisher" copy of a PLOS ONE article that cites it. Europe PMC held the real paper two candidates further down and was never asked |
+
+Five more were flagged by the first draft and were correct files: arXiv papers whose authors
+had retitled a later version, so the Semantic Scholar title no longer matched the page. Four
+carried the arXiv stamp and one did not. That is why the arXiv id is derived from a
+`10.48550/arXiv.*` DOI when Semantic Scholar omits it, and why the source URL is a signal.
+The check takes a quarter of a second on the median paper and five on the largest.
+
+The method and the thresholds are adapted from
+[fetchpdf](https://github.com/The-Metascience-Observatory/fetchpdf) (MIT licence), whose
+measurements on biomedical corpora fixed them; the notes on each constant in
+[`download/identity.py`](paper_downloader/download/identity.py) say what was re-checked here.
+`download.verify_identity: false` switches the check off.

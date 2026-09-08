@@ -46,6 +46,21 @@ class NotAPDFError(PDFValidationError):
         self.body = body
 
 
+class WrongPaperError(PDFValidationError):
+    """A real PDF arrived, and it is not the paper that was asked for.
+
+    Raised only on positive evidence -- the front pages name a different document, or the
+    file is a fragment of the record -- never because the file could not be checked. Like
+    NotAPDFError it is not retried: the server will send the same document again. The
+    download stage moves on to the next candidate. See paper_downloader.download.identity.
+    """
+
+    def __init__(self, message: str, *, verdict: dict | None = None, final_url: str = "") -> None:
+        super().__init__(message)
+        self.verdict = verdict or {}
+        self.final_url = final_url
+
+
 class HostBlockedError(DownloadError):
     """The host turned this client away without answering about the paper.
 

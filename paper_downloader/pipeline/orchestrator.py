@@ -15,12 +15,15 @@ from paper_downloader.core.exceptions import (
     MetadataError,
     NotAPDFError,
     ResolutionError,
+    WrongPaperError,
 )
 from paper_downloader.core.stages import PipelineStage
 from paper_downloader.download.downloader import PDFDownloader, DownloadResult
 from paper_downloader.download.landing_page import extract_pdf_url
 from paper_downloader.inputs.parser import parse_inputs
 from paper_downloader.metadata import record_class as rc
+from paper_downloader.download.identity import ExpectedIdentity
+from paper_downloader.metadata import works
 from paper_downloader.metadata import works
 from paper_downloader.metadata.pmc import (
     europepmc_render_url,
@@ -148,6 +151,10 @@ FAILURE_REASONS = (
     "host_denied",
     # 5xx, network error, metadata lookup failed.
     "transient",
+    # A real PDF arrived and it was a different document -- one the paper cites, a preview, a
+    # supplement. A fact about the source that offered it, not about the paper; a re-run once
+    # that source is fixed or another provider added can succeed.
+    "wrong_document",
     # Reached a real article page with no followable PDF link: a JavaScript download button,
     # a repository landing page with nothing deposited.
     "page_without_link",
@@ -541,6 +548,8 @@ class DownloadOrchestrator:
                     found.add("host_refused_client")
             elif status is not None and (status >= 500 or status == 429):
                 found.add("transient")
+            elif a.get("wrong_document"):
+                found.add("wrong_document")
             elif a.get("not_a_pdf"):
                 # A .pdf URL that answered with the article page, on an article published
                 # days ago, is a publisher that has not posted the file yet -- which time
@@ -977,6 +986,7 @@ class DownloadOrchestrator:
             message="downloading pdf", increment_attempt=True,
         )
 
+        expected = self._expected_identity(resolve_paper)
         attempts: list[dict[str, Any]] = []
         last_error: str | None = None
         tried_urls: set[str] = set()
@@ -1002,12 +1012,13 @@ class DownloadOrchestrator:
                             candidate.pdf_url,
                             output_pdf_path,
                             skip_if_valid=self.config.resume.verify_existing_files,
+                            expected=expected,
                         )
                     except NotAPDFError as exc:
                         hop.final_url = exc.final_url or None
                         result = self._retry_via_landing_page(
                             exc, candidate, output_pdf_path, hop,
-                            index=index, total=total, paper=paper,
+                            index=index, total=total, paper=paper, expected=expected,
                         )
                     hop.final_url = result.final_url or hop.final_url
                     attempts.append({
@@ -1039,7 +1050,7 @@ class DownloadOrchestrator:
 
                 except Exception as exc:
                     last_error = str(exc)
-                    if isinstance(exc, NotAPDFError) and exc.final_url:
+                    if isinstance(exc, (NotAPDFError, WrongPaperError)) and exc.final_url:
                         hop.final_url = exc.final_url
                     attempts.append({
                         "candidate_index": attempt_no,
@@ -1050,6 +1061,10 @@ class DownloadOrchestrator:
                         "error": str(exc),
                         "http_status": getattr(exc, "status_code", None),
                         "not_a_pdf": isinstance(exc, NotAPDFError),
+                        # A PDF arrived and it was somebody else's document. Recorded with
+                        # the verdict so the manifest says what the file called itself.
+                        "wrong_document": isinstance(exc, WrongPaperError),
+                        "identity": getattr(exc, "verdict", None) or None,
                         # Whether the host turned this server away rather than answering
                         # about the paper. A caller deciding "is this paper worth another
                         # attempt" cannot tell from the status alone -- see host_gate.
@@ -1102,6 +1117,7 @@ class DownloadOrchestrator:
         index: int,
         total: int,
         paper: PaperRecord,
+        expected: ExpectedIdentity | None = None,
     ) -> DownloadResult:
         """The URL served a web page. Look for the PDF link on it and try that, once.
 
@@ -1135,6 +1151,7 @@ class DownloadOrchestrator:
             hop.followed_from = exc.final_url or candidate.pdf_url
             return self.downloader.download(
                 rewritten, output_pdf_path, skip_if_valid=self.config.resume.verify_existing_files,
+                expected=expected,
             )
 
         landing_url = exc.final_url or candidate.pdf_url
@@ -1164,6 +1181,7 @@ class DownloadOrchestrator:
                 output_pdf_path,
                 skip_if_valid=self.config.resume.verify_existing_files,
                 referer=landing_url,
+                expected=expected,
             )
         except NotAPDFError as second:
             # The page's own PDF link may be the PMC interstitial (a PMC article page
@@ -1180,8 +1198,21 @@ class DownloadOrchestrator:
             hop.attempted_url = rewritten
             return self.downloader.download(
                 rewritten, output_pdf_path, skip_if_valid=self.config.resume.verify_existing_files,
+                expected=expected,
             )
         return result
+
+    @staticmethod
+    def _expected_identity(paper: PaperRecord) -> ExpectedIdentity:
+        """What the downloaded file will be checked against. No network: the Crossref
+        record, when there is one, was cached by the classify stage."""
+        page_range = None
+        cached = works.cached_crossref(paper.doi)
+        if cached:
+            page_range = cached.get("page") or None
+        return ExpectedIdentity(
+            doi=paper.doi, arxiv_id=paper.arxiv_id, title=paper.title, page_range=page_range,
+        )
 
     @staticmethod
     def _pmc_rewrite(exc: NotAPDFError) -> str | None:
