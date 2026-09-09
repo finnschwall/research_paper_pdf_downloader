@@ -7,8 +7,8 @@ import pytest
 
 from paper_downloader.config.models import ApiConfig, DownloadConfig
 from paper_downloader.core import host_gate
-from paper_downloader.core.exceptions import NotAPDFError, PDFValidationError
-from paper_downloader.download.downloader import PDFDownloader
+from paper_downloader.core.exceptions import HostBlockedError, NotAPDFError, PDFValidationError
+from paper_downloader.download.downloader import PDFDownloader, blame_host_url
 from paper_downloader.download.entitlement import not_the_full_article
 from paper_downloader.models.paper import PaperRecord
 from paper_downloader.pipeline.orchestrator import DownloadOrchestrator, _Hop
@@ -157,3 +157,73 @@ def test_a_followed_link_and_its_redirect_are_both_recorded():
         "followed_from": "https://nature.com/articles/s1",
         "final_url": "https://nature.com/articles/s1",
     }
+
+
+# --- who gets blamed for a refusal ---------------------------------------------------
+
+class _FakeResponse:
+    """Just enough of a `requests.Response` for the attribution path.
+
+    `url` is what requests sets after following redirects, which is the whole point here.
+    """
+
+    def __init__(self, *, url, status_code, body=b"", headers=None):
+        self.url = url
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._body = body
+
+    def iter_content(self, chunk_size=None):
+        yield self._body
+
+
+def test_a_publishers_refusal_is_not_filed_against_the_doi_resolver():
+    """The bug that took dx.doi.org out for 48 hours.
+
+    We ask the resolver, the publisher answers, and the publisher's Cloudflare challenge
+    used to be recorded under the host we asked -- the entry point for every remaining
+    paper in the batch.
+    """
+    response = _FakeResponse(
+        url="https://dl.acm.org/doi/10.1145/3387633",
+        status_code=403,
+        body=b"<!DOCTYPE html><html><head><title>Just a moment...</title>",
+    )
+    with pytest.raises(HostBlockedError) as caught:
+        PDFDownloader(DownloadConfig())._raise_for_error_status(
+            "https://dx.doi.org/10.1145/3387633", response,
+        )
+
+    assert caught.value.host == "dl.acm.org"
+    assert host_gate.block_state("https://dl.acm.org/doi/x") is not None
+    assert host_gate.block_state("https://dx.doi.org/10.1145/3387633") is None
+
+
+def test_the_requested_url_still_appears_in_the_message():
+    """Both facts are needed: which candidate we tried, and who turned it down."""
+    response = _FakeResponse(
+        url="https://dl.acm.org/doi/10.1145/3387633", status_code=403, body=b"denied",
+    )
+    with pytest.raises(HostBlockedError) as caught:
+        PDFDownloader(DownloadConfig())._raise_for_error_status(
+            "https://dx.doi.org/10.1145/3387633", response,
+        )
+    assert "dl.acm.org refused this server" in str(caught.value)
+    assert "https://dx.doi.org/10.1145/3387633" in str(caught.value)
+
+
+def test_a_response_with_no_final_url_falls_back_to_the_requested_one():
+    """A wrong host is still better than no cool-off on a host that is refusing us."""
+    response = _FakeResponse(url="", status_code=403, body=b"denied")
+    with pytest.raises(HostBlockedError) as caught:
+        PDFDownloader(DownloadConfig())._raise_for_error_status(
+            "https://esmorwd.org/article/1", response,
+        )
+    assert caught.value.host == "esmorwd.org"
+
+
+def test_blame_follows_the_last_hop_not_the_first():
+    response = _FakeResponse(url="https://ieeexplore.ieee.org/document/11282905/", status_code=202)
+    assert blame_host_url("https://doi.org/10.1109/ACCESS.2025.3641484", response) == (
+        "https://ieeexplore.ieee.org/document/11282905/"
+    )

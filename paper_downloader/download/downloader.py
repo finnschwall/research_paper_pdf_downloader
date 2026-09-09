@@ -35,6 +35,30 @@ _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504, 507, 509})
 _ERROR_BODY_PEEK_BYTES = 64 * 1024
 
 
+def blame_host_url(requested_url: str, response: requests.Response) -> str:
+    """The URL whose host actually answered, for anything filed against a host.
+
+    Every request here is sent with ``allow_redirects=True``, so the host that refuses us
+    is routinely not the host we asked. A DOI is the normal case: we ask ``doi.org``, it
+    answers 302, and the 403 comes from the publisher at the end of the chain. Blaming the
+    requested URL puts that 403 on the resolver, and the resolver is the entry point for
+    every remaining paper in the batch -- so one Cloudflare-fronted publisher took
+    ``dx.doi.org`` out for 15 minutes, then 6 hours, then 48. It happened in the September
+    2026 production run: ``host_refusals.json`` recorded "dx.doi.org, HTTP 403 with a
+    5614-byte refusal page", and dx.doi.org answers a plain 302 to any client, browser
+    agent or not. The 5614 bytes were a Cloudflare challenge page belonging to whoever the
+    DOI pointed at, and nothing in the record said which publisher that was.
+
+    So: `response.url`, which requests sets to the last hop it followed. Falls back to the
+    requested URL when the response carries none, because a wrong host is still better
+    than no cool-off at all on a host that is genuinely refusing us.
+
+    The message text keeps the requested URL as well. A reader needs both -- which
+    candidate we tried, and who turned it down.
+    """
+    return str(getattr(response, "url", "") or "") or requested_url
+
+
 def _retry_after_seconds(response: requests.Response) -> float:
     """`Retry-After` in seconds, or a conservative default when it is absent or a date.
 
@@ -248,14 +272,15 @@ class PDFDownloader:
                 # nothing about why.
                 if total_bytes == 0 and response.status_code != 200:
                     tmp_path.unlink(missing_ok=True)
+                    blamed = blame_host_url(url, response)
                     kind = host_gate.note_response(
-                        url, response.status_code, b"", headers=response.headers,
+                        blamed, response.status_code, b"", headers=response.headers,
                     )
                     if kind:
                         raise HostBlockedError(
-                            f"{host_gate.host_key(url)} answered HTTP "
+                            f"{host_gate.host_key(blamed)} answered HTTP "
                             f"{response.status_code} with an empty body for: {url}",
-                            host=host_gate.host_key(url),
+                            host=host_gate.host_key(blamed),
                             challenge=(kind == "challenge"),
                         )
         except (DownloadError, PDFValidationError):
@@ -346,6 +371,9 @@ class PDFDownloader:
         our IP away" is only visible in it. The first is an answer about the paper; the
         second is an answer about us, and conflating them is how a temporary block became a
         permanent verdict on 36 papers.
+
+        Whichever it is, it is filed against the host that answered -- see
+        `blame_host_url` -- and never against the host we asked.
         """
         peek = b""
         try:
@@ -353,21 +381,26 @@ class PDFDownloader:
         except Exception:
             pass
 
-        if response.status_code == 429:
-            host_gate.note_retry_after(url, _retry_after_seconds(response))
+        blamed = blame_host_url(url, response)
+        host = host_gate.host_key(blamed)
 
-        kind = host_gate.note_response(url, response.status_code, peek, headers=response.headers)
+        if response.status_code == 429:
+            host_gate.note_retry_after(blamed, _retry_after_seconds(response))
+
+        kind = host_gate.note_response(
+            blamed, response.status_code, peek, headers=response.headers,
+        )
         if kind == "challenge":
             raise HostBlockedError(
-                f"{host_gate.host_key(url)} bot-challenged this client with HTTP "
+                f"{host} bot-challenged this client with HTTP "
                 f"{response.status_code} for: {url}",
-                host=host_gate.host_key(url), challenge=True,
+                host=host, challenge=True,
             )
         if kind == "refusal":
             raise HostBlockedError(
-                f"{host_gate.host_key(url)} refused this server with HTTP "
+                f"{host} refused this server with HTTP "
                 f"{response.status_code} for: {url}",
-                host=host_gate.host_key(url),
+                host=host,
             )
 
         raise HTTPStatusError(

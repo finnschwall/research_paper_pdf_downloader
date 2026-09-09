@@ -32,6 +32,7 @@ want the second one, read [Downloading PDFs](#downloading-pdfs) and
   - [Records with nothing to fetch](#records-with-nothing-to-fetch)
   - [Why the fetch failed](#why-the-fetch-failed)
   - [Bot walls, and why another machine does not help](#bot-walls-and-why-another-machine-does-not-help)
+  - [Why there is no headless browser](#why-there-is-no-headless-browser)
 - [Talking to publishers politely](#talking-to-publishers-politely)
 - [What a run leaves on disk](#what-a-run-leaves-on-disk)
 - [Finding papers: the metadata pipeline](#finding-papers-the-metadata-pipeline)
@@ -413,15 +414,21 @@ it" — a fact about the client, not about the paper, and a different thing from
 This was measured rather than assumed. Every refusal was re-tested from a second machine, on
 a different network, in a different country, on a different provider. Every one answered
 identically. A `curl` control with a Chrome User-Agent got the same refusals as Python
-`requests`. **The discriminator is not the address and not the User-Agent — it is that the
-client is not a browser.**
+`requests`, and so did `curl_cffi` impersonating Chrome's real TLS fingerprint. **The
+discriminator is not the address, not the User-Agent and not the TLS fingerprint — it is that
+the client does not execute JavaScript.**
+
+The clearest single measurement is one pair of requests to the same host, one second apart:
+`doaj.org/api/search/articles/doi:…` answered `200` with JSON, while
+`doaj.org/article/<id>` answered `403` with `cf-mitigated: challenge`. Same address, same
+process. No rate limit can do that, which is why none of this is treated as one.
 
 | Wall | Hosts | What you see |
 |---|---|---|
 | Cloudflare | ACM, ACS, Taylor & Francis, OUP, ASME, Wiley, Sage, Emerald, AACR, SSRN | 403, `Cf-Mitigated: challenge`, "Just a moment…" |
-| Edge bot filter | MDPI | 403, a 400-byte "Access Denied" page |
+| Akamai Bot Manager | MDPI | 403, a 399-byte "Access Denied" page with a reference id |
 | Elsevier's own | ScienceDirect | 403 with an 800 KB HTML page and no marker to find |
-| IEEE's own | IEEE Xplore | 202 with an empty body |
+| AWS WAF | IEEE Xplore | 202 — empty to this library's agent, 2 KB of `awsWafCookie` JS to a browser one |
 | Radware | IOP | HTML, then a redirect to a captcha |
 | Imperva Incapsula | some repository mirrors | A 212-byte page that loads a JavaScript challenge |
 
@@ -437,6 +444,62 @@ so the page was never read, and the obvious-looking fix (raise the size limit) w
 changed nothing. And Elsevier's 800 KB page is too big for a size heuristic and carries no
 recognisable boilerplate, so a small list of hosts *measured* to bot-check every script is
 consulted as well as the markers.
+
+### Why there is no headless browser
+
+The walls above all ask for a browser, and a headless one — Playwright, Selenium, an
+undetected Chrome build — would clear most of them. This library does not use one, and the
+decision is deliberate rather than unfinished. Anyone reaching for it should read this first,
+because the reasons are not technical.
+
+**It would put a subscribing institution's access at risk.** ACM's Digital Library policy
+says that using scripts or spiders to download articles automatically "is a serious violation
+of ACM's DL usage policy and will result in the temporary or permanent termination of
+download rights for the subscribing institution". Not this client's rights — the
+institution's, for everybody behind that IP range. A browser that solves the challenge is
+still a script by that definition; the challenge is *how* the policy is enforced, so getting
+past it is the violation, not a workaround for one. IEEE's terms point the same way from the
+other side: text and data mining "is permitted for non-commercial research purposes only and
+requires an active IEEE Xplore institutional subscription", and IEEE's answer to that need is
+an API, not their website. A tool that solves a bot check is answering a question the
+publisher already answered differently.
+
+**A bot wall is a statement of preference, and the sanctioned route usually exists.** Every
+publisher in the table above offers a text-and-data-mining API or has its open content in an
+aggregator. Two of those routes are already wired up here (`wiley`, `elsevier` under
+[Publisher APIs](#publisher-apis)) and they work: one token turns a Cloudflare 403 into a
+2 MB PDF in a single request, with no challenge to solve and nothing to disguise. Where the
+API needs an institutional subscription, the thing to obtain is the subscription's API
+credentials — which is a conversation with a library, not a code change.
+
+**It buys much less than it looks like it would.** Measured on a real 582-paper review
+(2026-09-08), 82 papers had no full text. Cross-checked against OpenAlex, Semantic Scholar,
+Unpaywall and OpenAlex's paid full-text cache, **65 of the 82 are closed-access with no free
+copy anywhere** — 48 of them IEEE conference papers. A browser cannot conjure a paper nobody
+published for free. The remaining 17 are genuinely open access and genuinely unreachable,
+which is a real loss, and it is the entire prize. Seventeen papers is not worth an
+institution's access.
+
+**It also breaks the politeness guarantee.** Every request in this library passes through
+`core/host_gate.py`, which is what keeps us from earning the IP-shaped bans that the walls
+above are *not*. A browser automation layer runs its own network stack — its own connection
+pool, its own asset fetches, its own retries — and none of it goes through that gate. The
+rate limit would become advisory.
+
+**Do not reach for a cheaper version of the same idea either.** TLS fingerprint impersonation
+is the obvious middle path and it was tested: `curl_cffi` impersonating Chrome, same machine,
+same address. DOAJ still returned `cf-mitigated: challenge`; IEEE Xplore still returned its
+AWS WAF 202. MDPI was the only one that moved at all — from Akamai's 403 to a 200 carrying a
+`bm-verify` token, which then returned 403 when followed. All three want JavaScript executed.
+So fingerprint impersonation is not a smaller, safer version of a headless browser; it is the
+same intent with none of the capability. It is not in `requirements.txt` for that reason.
+
+**What this library does instead**, in order: prefer the aggregator or repository copy, then
+the publisher's own API where a key exists, and where neither has it, record *why* with a
+status specific enough to act on (see [Why the fetch failed](#why-the-fetch-failed)). A paper
+recorded as `client_challenged` or `host_denied` is a paper waiting on a credential or on
+interlibrary loan, and saying so is a better answer than a copy obtained in breach of the
+terms the institution signed.
 
 ---
 
@@ -460,6 +523,17 @@ refusals are remembered in a JSON file under the data root and escalate — 15 m
 6 hours, then 48 — because a ban is a fact about this client and this host, and a fresh
 process should not have to earn it again. Bot challenges are tracked separately, with a flat
 one-hour skip and no escalation and no persistence, for the reasons above.
+
+**A refusal is filed against the host that answered, never the host we asked.** Requests
+follow redirects, so those are routinely different, and a DOI is the normal case: we ask
+`doi.org`, it answers 302, and the 403 comes from the publisher at the end of the chain.
+Blaming the requested URL puts a publisher's cool-off on the resolver — and the resolver is
+the entry point for every remaining paper in the batch. It happened: the September 2026
+production run recorded `dx.doi.org, HTTP 403 with a 5614-byte refusal page`, and dx.doi.org
+answers a plain 302 to any client. Those 5614 bytes were a Cloudflare challenge page
+belonging to whoever the DOI pointed at, and nothing in the record said which publisher that
+was. `download/downloader.py::blame_host_url` is the one place that decides this; a message
+still names the candidate URL as well, because a reader needs both facts.
 
 **Rate state is per process.** The limiter is module-level, so it bounds one Python process.
 Several processes each get their own gate and the effective rate multiplies.
