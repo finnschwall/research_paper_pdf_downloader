@@ -21,7 +21,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "1.0"
+# 1.1 adds two things, both additive: `citation_graph` bundles now keep
+# references that carry no identifier (see _validate), and `_provenance` may
+# carry `intents` and `contexts`. SEER checks the major version only.
+SCHEMA_VERSION = "1.1"
 
 _VALID_RUN_TYPES = {"keyword_search", "by_id", "citation_graph"}
 _VALID_EDGE_TYPES = {"citation", "reference"}
@@ -63,8 +66,9 @@ def _validate(
     manifest_extra: dict,
 ) -> tuple[list[dict], int]:
     """
-    Validate papers against contract §3 STRICT rules.  Returns (kept_papers,
-    identity_dropped_count).  Raises ValueError on structural violations.
+    Validate papers against contract §3 STRICT rules.  Returns
+    (kept_papers, identity_dropped_count, identity_less_kept_count).
+    Raises ValueError on structural violations.
     """
     if run_type not in _VALID_RUN_TYPES:
         raise ValueError(
@@ -75,6 +79,7 @@ def _validate(
 
     kept: list[dict] = []
     identity_dropped = 0
+    identity_less = 0
 
     for i, paper in enumerate(papers):
         prov = paper.get("_provenance")
@@ -129,20 +134,36 @@ def _validate(
                     f"{_VALID_FETCH_STATUSES}."
                 )
 
-        # Identity guarantee: drop found records with no usable identifier.
+        # Identity: a record with no paperId, DOI or ArXiv id cannot become a
+        # paper on its own. What to do with it depends on the run type.
+        #
+        # For a keyword search or a by-id fetch it is a broken result and is
+        # dropped, as it always has been.
+        #
+        # For a CITATION GRAPH it is the point. Roughly one reference in six
+        # comes back as a title and a venue string only, and that is the only
+        # channel through which grey literature -- a Transformer Circuits
+        # article, a forum post, a lab's write-up -- is visible at all: it is
+        # in no index, so the bibliographies of papers we already hold are the
+        # only place it appears. Dropping those here lost 100% of that content
+        # before the consumer ever saw it. They are kept and counted, and it is
+        # the consumer's job to keep them out of its paper table -- SEER stores
+        # them as CitedWork rows beside the corpus, never as Papers.
         fetch_status = prov.get("fetch_status")
         is_found = fetch_status == "found" if run_type == "by_id" else True
         if is_found and not _has_identity(paper):
-            identity_dropped += 1
-            logger.warning(
-                "Dropping record %d — no paperId/DOI/ArXiv (title=%r)",
-                i, paper.get("title", "")[:60],
-            )
-            continue
+            if run_type != "citation_graph":
+                identity_dropped += 1
+                logger.warning(
+                    "Dropping record %d — no paperId/DOI/ArXiv (title=%r)",
+                    i, paper.get("title", "")[:60],
+                )
+                continue
+            identity_less += 1
 
         kept.append(paper)
 
-    return kept, identity_dropped
+    return kept, identity_dropped, identity_less
 
 
 def write_bundle(
@@ -173,15 +194,23 @@ def write_bundle(
     bundle_dir = Path(bundle_dir)
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
-    kept_papers, identity_dropped = _validate(run_type, papers, manifest_extra)
+    kept_papers, identity_dropped, identity_less = _validate(
+        run_type, papers, manifest_extra)
 
     if identity_dropped:
         logger.warning("%d records dropped (no usable identifier).", identity_dropped)
+    if identity_less:
+        logger.info(
+            "%d references kept with no identifier — the consumer must not make "
+            "papers of them.", identity_less,
+        )
 
     counts = dict(manifest_extra.get("counts") or {})
     counts["total_unique_papers"] = len(kept_papers)
     if identity_dropped:
         counts["identity_dropped"] = identity_dropped
+    if identity_less:
+        counts["identity_less"] = identity_less
 
     papers_path = bundle_dir / "papers.json"
     # Write papers first so a missing manifest signals a partial bundle.

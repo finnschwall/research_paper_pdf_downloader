@@ -680,27 +680,31 @@ def export_citation_bundle(
             edges_fetched.append("references")
         seeds.append({"seed_paper_id": result.paper_id, "edges": edges_fetched})
 
-        for p in result.citations:
-            p["_provenance"] = {
+        def _attach(p: dict, edge_type: str) -> dict:
+            prov = {
                 "matched_queries": [],
                 "seed_paper_id": result.paper_id,
-                "edge_type": "citation",
+                "edge_type": edge_type,
                 "is_influential": p.pop("_is_influential", False),
                 "input_id": None,
                 "fetch_status": None,
             }
-            flat_papers.append(p)
+            # Per-edge facts move off the paper record and into provenance,
+            # where they belong: they describe this citation, not the work.
+            intents = p.pop("_intents", None)
+            contexts = p.pop("_contexts", None)
+            if intents:
+                prov["intents"] = intents
+            if contexts:
+                prov["contexts"] = contexts
+            p["_provenance"] = prov
+            return p
+
+        for p in result.citations:
+            flat_papers.append(_attach(p, "citation"))
 
         for p in result.references:
-            p["_provenance"] = {
-                "matched_queries": [],
-                "seed_paper_id": result.paper_id,
-                "edge_type": "reference",
-                "is_influential": p.pop("_is_influential", False),
-                "input_id": None,
-                "fetch_status": None,
-            }
-            flat_papers.append(p)
+            flat_papers.append(_attach(p, "reference"))
 
     bundle_path = Path(bundle_dir).resolve()
     write_bundle(

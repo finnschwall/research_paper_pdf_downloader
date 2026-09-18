@@ -70,9 +70,18 @@ def load_config(config_path: str | Path) -> MetadataConfig:
             base_dir=output_raw["base_dir"],
         ),
         citation_graph=CitationGraphConfig(
+            # Two groups here. The first is everything SEER needs to build a
+            # complete Paper from a reference, so an imported reference is not
+            # a stub -- `venue` most of all: a reference with no identifier is
+            # attributed to whatever published it by its venue string alone,
+            # and without this field every such record arrives anonymous.
+            # The second group (isInfluential, intents, contexts) is per-EDGE
+            # rather than per-paper: why this seed cited this work.
             fields=cg_raw.get(
                 "fields",
-                "paperId,title,year,authors,abstract,isInfluential,citationCount,externalIds",
+                "paperId,title,year,authors,abstract,venue,publicationVenue,"
+                "publicationDate,publicationTypes,isOpenAccess,openAccessPdf,url,"
+                "citationCount,externalIds,isInfluential,intents,contexts",
             ),
             max_results=_cg_max,
             request_delay=float(cg_raw.get("request_delay", 1.0)),

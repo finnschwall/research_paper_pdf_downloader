@@ -388,15 +388,27 @@ def fetch_paper_graph(
         # not the SS SHA unless the caller supplied a SHA; for other formats
         # (DOI:..., ARXIV:...) it retains the prefix.  The field documents
         # the exact identifier that was sent to the API.
+        def _edge_fields(edge: dict, paper: dict) -> dict:
+            """Copy the per-EDGE facts onto the paper record.
+
+            `isInfluential`, `intents` and `contexts` describe the citation,
+            not the cited work: the same paper cited by two seeds has two sets
+            of them. They ride on the record because that is the shape the
+            bundle carries, and are stripped back off into `_provenance` by
+            the exporter.
+            """
+            paper["_is_influential"] = bool(edge.get("isInfluential"))
+            if edge.get("intents"):
+                paper["_intents"] = edge["intents"]
+            if edge.get("contexts"):
+                paper["_contexts"] = edge["contexts"]
+            return paper
+
         def _extract_citation(e: dict) -> dict:
-            p = dict(e.get("citingPaper") or e)
-            p["_is_influential"] = bool(e.get("isInfluential"))
-            return p
+            return _edge_fields(e, dict(e.get("citingPaper") or e))
 
         def _extract_reference(e: dict) -> dict:
-            p = dict(e.get("citedPaper") or e)
-            p["_is_influential"] = bool(e.get("isInfluential"))
-            return p
+            return _edge_fields(e, dict(e.get("citedPaper") or e))
 
         results.append(PaperGraphResult(
             input_id=raw_id,
